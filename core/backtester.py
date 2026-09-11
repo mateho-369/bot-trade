@@ -25,6 +25,10 @@ def run_backtest(df, symbol="SYMBOL", verbose=True):
     # Step 2: drop warmup rows (NaN from EMA/ATR/pivot calc)
     df_feat = df_feat.dropna(subset=['buy_signal','sell_signal','atr','ema'])
     df_feat = df_feat.reset_index(drop=False)  # keep time as column
+    # Defensive: the time column takes the name of whatever the index was
+    # (live MT5 data names it 'time'; lab data may differ)
+    if 'time' not in df_feat.columns:
+        df_feat = df_feat.rename(columns={df_feat.columns[0]: 'time'})
 
     if len(df_feat) == 0:
         logger.info(f"[{symbol}] No valid rows after warmup drop")

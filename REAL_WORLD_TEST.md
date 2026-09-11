@@ -164,3 +164,53 @@ Code ក្នុង repo បានរត់ឡើងវិញលើទិន្
 - លទ្ធផលតេស្ត = +0.02R/trade ជាមធ្យម (PF 1.15) — នេះជា edge **តូច តែវិជ្ជមាន** ជាមួយ DD តូច (4R) — មិនមែនម៉ាស៊ីនបោះពុម្ពលុយទេ; គោលការណ៍ទីផ្សារពិត គឺ ២–៥%/ខែ ជាមួយ DD <20% គឺល្អខ្លាំង
 - មុនពេលលុយពិត: **demo 2–3 ខែ** មើលថា live = backtest (spread/slippage ពិត) · ប្រើ broker Raw/ECN បើអាច
 - ប្រសិនបើ live ខុសពី backtest ច្រើន → បិទ SR (ENTRY_ENGINE = "SMC_MTF") ឬបិទ bot — stop បានដាក់រួច
+
+# 🧪 Sandbox Self-Test — Paper Auto-Trade ពេញលក្ខណៈ (v1.9.2)
+
+> រត់ដោយ **ខ្លួនឯង** ក្នុង sandbox (គ្មាន MT5 terminal, គ្មាន live feed) — ប្រើ **candle ពិត XAUUSD** + **broker សាក (fake MT5)** ដែលមាន API ដូច module `MetaTrader5` ពិត។ Bot ដែលរត់ = **`main.py` ពិត** របស់អ្នក (មិនមែន replica)។
+
+## របៀបធ្វើ
+1. **ទិន្នន័យ** — free live APIs ទាំងអស់ (stooq, binance, twelvedata) ប្រព្រឹកក្នុង sandbox → ប្រើ M1 XAUUSD ពិត 2009–2025 (GitHub, រសាត់ពី MT5)។ Window paper: **2025-09-01 → 2025-12-31** (85,680 M1 bars)។
+2. **Fake broker** — spread 0.25 (Exness-like) + slippage 0.05 · SL/TP ដកធានាដោយ broker **រាល់ tick ក្នុង M1 bar** (SL ត្រួតពិនិត្យមុន TP, តាម bid/ask ពិត) · min-stop validation (reject បើ SL ខ្ចាត់) · position ticket ពិត · deals history · account/margin ពិត។
+3. **Clock សាក** — bot មើល `datetime.now()` = ពេល replay · loop រត់ជាជំហាន 15 វិនាទី (management ក្រោយជាត្រឹម 15 នាទី; SL/TP ពិត ១០០% លើ tick គ្រប់ម៉ោង)។
+
+## ✅ Unit self-test: 27/27 PASS
+config គ្មាន secret · SMC pivot/sweep/BOS lag ត្រឹមត្រូវ · MTF decision + M15 priority + H1 gate · SR trigger + consumed per day · backtester next-bar-open · risk manager (lot sizing, 1-pos តាម balance, daily −20% halt, drawdown −30% halt, margin guard, withdrawal ladder) · ML train/predict + **single-class fail-closed** · state logger change-only · trade manager break-even 60% + signed progress (មិន trail លើ adverse) · connector (credentials required, forming bar skip, place→position ticket, min-stop, closed trades group fix, 7-day window)។
+
+## 📊 លទ្ធផល Paper (luc $1,000, real candles 4.5 ខែ)
+| ម៉ូត | signals | ដាក់ | បិទ | WR | PF | E[R] | PnL | maxDD |
+|---|---|---|---|---|---|---|---|---|
+| **1 position (config ដែលបានតេស្ត)** | 83 | 79 | 78 | **43.6%** | **1.43** | **+0.25** | **+$198.43 (+19.8%)** | $133 (13.3%) |
+| 3 positions (default `MAX_POSITIONS=3`) | 93 | 91 | 90 | 42.2% | 1.32 | +0.19 | +$183.11 (+18.3%) | $181 (18.1%) |
+
+- ខែដោយខែ (1-pos): Sep **+$64** · Oct **+$69** · Nov **−$45** · Dec **+$110** (3/4 ខែវិជ្ជមាន — ស្របពី backtest ឆ្នាំ 2024–2025 ដែល Nov–Dec 2025 ក៏ខ្លាំង)
+- ML retrain ដើរពិត (rolling 30→90 trades) · withdrawal milestone $100/$200 ដើរ · day-roll risk state ដើរ · balance accounting ត្រឹមត្រូវ (ត្រួតពិនិត្យ ដល់ 1e-6)
+- 2–3 signals ត្រូវបាន SKIP ដោយ SL-distance guard + 1 REJECT ដោយ min-stop (broker) — bot ចាប់បានល្អ មិន crash
+
+## 🆚 Paper vs Backtest Parity (window ដូចគ្នា)
+| | backtest parity | paper (main.py ពិត) |
+|---|---|---|
+| trades (បិទ) | 68 | 78 |
+| WR | 41.2% | 43.6% |
+| PF | 1.27 | 1.43 |
+| E[R] | +0.21 | +0.25 |
+| maxDD | 2.6R | 6.1R |
+| ខែវិជ្ជមាន | 3/4 | 3/4 |
+
+**68/79 (86%) trades paper = trades parity ត្រូវគ្នាត្រង់នាទី** — ភាពខុស 11 trades ជា **cascade ពី execution គ្រាប់**: backtest រក SL/TP លើ high/low របស់ H1 bar (SL មុន TP) · paper រកលើ tick M1 ពិត + spread/slippage + entry នៅ ask → កម្រិត SL/TP ធ្លាក់ ±0.1–0.3 → ពេលបិទខុស ១ម៉ោង → ខុស។ នេះជា **backtest↔live gap ពិតប្រាកដ** (មធ្យមប្រភេទ bot ពិភពលោក ខុសធំជាងនេះច្រើន — ឧ. Gold Reaper: backtest PF 2.72 → live PF 1.08)។
+
+**ការរកឃើញ (honest):** parity backtest មាន H4 lookahead រមៀង — វាប្រើ H4 bar កំពុងបង្កើត ជាមួយតម្លៃចប់របស់វា (មិនអាចមានក្នុង live)។ ក្នុង window នេះ: parity មាន 102 signals ប៉ុន្តែ **9 ក្នុងនោះ មិនអាចកើតឡើងក្នុង bot ពិត** (ពឹងផ្អែកលើ lookahead) → **bot ពិត = 93 signals (stringent ជាង)**។ លទ្ធផល paper ខាងលើ = លទ្ធផលដែល live នឹងឃើញ។
+
+## 🐛 Bugs រកឃើញក្នុងការ self-test នេះ — បាន FIX រួច (v1.9.2)
+| កន្លែង | បញ្ហា | Fix |
+|---|---|---|
+| `main.py` | `datetime.utcnow()` — deprecated + crash loop ពេល datetime គ្មាន `utcnow` | `datetime.now(timezone.utc)` |
+| `ml/model.py` | model មើលឃើញ LOSS មិនឃើញ WIN ម្តង → `predict` **fail-open** (ចាយទាំងអស់!) | **fail-closed**: `return False, 0.0` រហូតដល់មាន WIN ក្នុង data |
+| `core/mt5_connector.py` | `place_buy/sell` ត្រឡប់ **order id** មិនមែន **position ticket** → open trade មិនត្រូវបានគ្រប់គ្រង (breakeven/trailing មិនដំណើរការ) | ត្រឡប់ position ticket ពិត (positions_get, fallback order id) |
+| `core/backtester.py` | crash បើ index name មិនមែន `time` | rename មុខងារដើម្បី defensive |
+
+## ⚠️ ការពេល (honest)
+- **Management ១៥ នាទី** — breakeven/trailing/SRTP-modify ក្រោយជាត្រឹម 15 នាទី (SL/TP មុនដើររាល់ tick មិនបាត់)។ Live ពិត loop រាប់វិនាទី → ល្អជាង paper
+- **ទិន្នន័យហ្វុំដល់ 2025-12-31** — sandbox គ្មាន live feed; ខែកញ្ញា–ធ្នូ 2025 ជា **period ល្អ** របស់ engine (24 ខែពេញ = +0.02R/trade, មិនមែន +0.25R ទេ)
+- **`MAX_POSITIONS=3` (default) = stacking មិនទាន់បានតេស្ត** — build ដែលបានតេស្ត (duel + parity) គឺ 1 position; លទ្ធផល 1-pos ខាងលើ = អ្វីដែលបានបញ្ជាក់
+- Paper ល្អ ≠ live ធានា — ដំណាក់កាលបន្ទាប់: **demo 2–3 ខែ** ប្រៀបធៀប live vs paper នេះ (spread/slippage ពិត, execution រាប់វិនាទី)

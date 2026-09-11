@@ -173,6 +173,14 @@ def place_buy(symbol, lot, sl, tp, comment="BOSS BUY"):
             return None, f"Retcode:{result.retcode if result else '?'} {result.comment if result else ''}"
 
     logger.info(f"[{symbol}] BUY | Price:{price} TP:{tp} SL:{sl} Ticket:{result.order}")
+    # Return the real POSITION ticket (MT5 positions are managed by position
+    # id; the order id can differ). Fall back to the order id.
+    try:
+        poss = mt5.positions_get(symbol=symbol)
+        if poss:
+            return max(poss, key=lambda p: p.time).ticket, "OK"
+    except Exception:
+        pass
     return result.order, "OK"
 
 
@@ -214,6 +222,13 @@ def place_sell(symbol, lot, sl, tp, comment="BOSS SELL"):
             return None, f"Retcode:{result.retcode if result else '?'} {result.comment if result else ''}"
 
     logger.info(f"[{symbol}] SELL | Price:{price} TP:{tp} SL:{sl} Ticket:{result.order}")
+    # Return the real POSITION ticket (see place_buy).
+    try:
+        poss = mt5.positions_get(symbol=symbol)
+        if poss:
+            return max(poss, key=lambda p: p.time).ticket, "OK"
+    except Exception:
+        pass
     return result.order, "OK"
 
 

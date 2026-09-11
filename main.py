@@ -1,5 +1,5 @@
 # ============================================================
-#   main.py  —  BOSS SMC BOT  v1.9.0
+#   main.py  —  BOSS SMC BOT  v1.9.2
 #   Deep Improvements: High-Freq Loop + Continuous Learning
 # ============================================================
 
@@ -204,7 +204,7 @@ def process_symbol_hf(symbol):
 
 def _refresh_consumed(state):
     """SR engine: keep per-day consumed-level sets, drop old days."""
-    today = datetime.utcnow().date().toordinal()
+    today = datetime.now(timezone.utc).date().toordinal()
     if state.get('consumed_day') != today:
         state['consumed'] = {d: s for d, s in state.get('consumed', {}).items()
                              if today - d <= 2}
@@ -363,7 +363,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v1.9.0  —  High-Freq Loop")
+    logger.info(f"  BOSS SMC BOT  v1.9.2  —  High-Freq Loop")
     logger.info("=" * 57)
 
     if not connect():
