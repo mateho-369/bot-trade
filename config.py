@@ -132,9 +132,20 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Session Filter ────────────────────────────────────────────
-SESSION_FILTER = False
+# Engine duel (v1.9): Asia/low-liquidity hours hurt M1 signals.
+# London+NY window (UTC) — the window the best gold bots trade in.
+SESSION_FILTER = True
 SESSION_START  = 7
 SESSION_END    = 20
+
+# ── Engine v1.9 architecture filters (from engine-vs-engine duel) ──
+# Block new entries when they go AGAINST the H1 EMA trend.
+# The duel showed counter-trend M1 entries are the main bleed.
+H1_TREND_FILTER  = True
+H1_EMA_LEN       = 50
+# When an M15 signal exists, trade ONLY the M15 signal (ignore M1/M5 noise).
+# Wider ATR → SL distance grows → spread becomes a smaller % of risk.
+MTF_PRIORITY_M15 = True
 
 # ── Logging ───────────────────────────────────────────────────
 LOG_PATH = "logs/bot.log"

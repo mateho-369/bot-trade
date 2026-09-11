@@ -146,7 +146,7 @@ def msg_ml_retrain(n_trades, winrate, n_patterns):
 
 def msg_bot_start(symbols):
     return (
-        f"🚀  <b>BOSS SMC BOT v1.8.0 — started</b>\n"
+        f"🚀  <b>BOSS SMC BOT v1.9.0 — started</b>\n"
         f"{_hr()}\n"
         f"📊 Symbols: <b>{', '.join(symbols)}</b>\n"
         f"⏱ Timeframe: M1  ·  loop 1.0s\n"

@@ -1,5 +1,5 @@
 # ============================================================
-#   main.py  —  BOSS SMC BOT  v1.8.0
+#   main.py  —  BOSS SMC BOT  v1.9.0
 #   Deep Improvements: High-Freq Loop + Continuous Learning
 # ============================================================
 
@@ -34,7 +34,7 @@ from core.mt5_connector  import (
 from core.smc_engine     import compute_features, get_latest_signal
 from core.backtester     import run_backtest
 from core.trade_manager  import manage_open_trade
-from core.mtf_engine     import scan_all_timeframes
+from core.mtf_engine     import scan_all_timeframes, h1_trend_direction, h1_gate_ok
 from core                import risk_manager
 from core.state_logger   import event, signal_log
 from ml.model            import SMCModel, TradeLogger
@@ -176,7 +176,13 @@ def process_symbol_hf(symbol):
         if _in_session():
             decision = scan_all_timeframes(symbol, get_candles)
             if decision:
-                execute_trade(symbol, decision, cur_bar)
+                # v1.9 H1 trend gate — block entries against the H1 EMA trend
+                h1_dir = h1_trend_direction(get_candles(symbol, "H1", count=300))
+                if h1_gate_ok(decision['direction'], h1_dir):
+                    execute_trade(symbol, decision, cur_bar)
+                else:
+                    signal_log.log(f"{symbol}:h1",
+                                   f"● HOLD {symbol} {decision['direction']} — against H1 trend")
 
 def execute_trade(symbol, decision, cur_bar):
     state = symbol_state[symbol]
@@ -308,7 +314,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v1.8.0  —  High-Freq Loop")
+    logger.info(f"  BOSS SMC BOT  v1.9.0  —  High-Freq Loop")
     logger.info("=" * 57)
 
     if not connect():
