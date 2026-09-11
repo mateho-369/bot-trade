@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.dist/
+
+# Logs & runtime data
+logs/
+SMC_Bot_Data/data/*.csv
+SMC_Bot_Data/models/*.pkl

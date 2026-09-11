@@ -1,0 +1,4 @@
+time,symbol,ticket,signal,outcome,profit,entry,tp,sl,atr,spread_pct,atr_pct,rsi,close_vs_ema,body_pct,hour_utc,bull_sweep,bear_sweep,bull_bos,bear_bos
+2026-06-10,XAUUSDm,101,BUY,,,2000,2100,1950,10,0.01,0,50,0,0,0,0,0,0,0
+2026-06-10,XAUUSDm,102,BUY,1.0,50.0,2000,2100,1950,10,0.01,0,50,0,0,0,0,0,0,0
+2026-06-10,XAUUSDm,103,BUY,,,2000,2100,1950,10,0.01,0,50,0,0,0,0,0,0,0
