@@ -29,7 +29,8 @@ from core.mt5_connector  import (
     get_spread_percent,
     place_buy, place_sell,
     get_open_positions,
-    get_closed_trades, get_account_info
+    get_closed_trades, get_account_info,
+    get_position_by_ticket
 )
 from core.smc_engine     import compute_features, get_latest_signal
 from core.backtester     import run_backtest
@@ -42,6 +43,16 @@ from ml.model            import SMCModel, TradeLogger
 from tg_alerts.alerts    import (send, msg_signal, msg_closed,
                                   msg_bot_start, msg_error, msg_ml_retrain,
                                   msg_blacklist, msg_milestone)
+
+# ── RARC: Regime Adaptation & Risk Correction Engine ─────────
+# Soft coupling: if the rarc package is removed the bot still runs
+# with its legacy safety stack (fail-open import, hard-coded skip).
+try:
+    from rarc import RarcEngine
+    RARC_AVAILABLE = True
+except ImportError as _e:
+    RARC_AVAILABLE = False
+    print(f"RARC engine unavailable ({_e}) — legacy risk stack only")
 
 # ── LOGGING ──────────────────────────────────────────────────
 os.makedirs("logs",   exist_ok=True)
@@ -83,6 +94,45 @@ trade_logger         = TradeLogger()
 trades_since_retrain = 0
 last_retrain_time    = datetime.now()
 risk_state           = risk_manager.RiskState()
+
+# ── RARC singleton (the bounded safety layer) ────────────────
+rarc = RarcEngine(symbols=config.SYMBOLS) if RARC_AVAILABLE else None
+
+
+def _rarc_shadow_lookup(symbol, ts_iso, direction, sl, tp):
+    """
+    Counterfactual resolver for Smart-Gate-blocked signals: replay
+    M15 candles after the block and see whether the trade would have
+    hit TP (win) or SL (loss) first. Feeds the live self-audit that
+    auto-relaxes the gate if it starts deleting edge.
+    """
+    try:
+        t0 = pd.Timestamp(ts_iso)
+        if t0.tzinfo is not None:
+            t0 = t0.tz_convert("UTC").tz_localize(None)   # compare naive↔naive
+        df = get_candles(symbol, "M15", count=400)
+        if df is None or len(df) == 0:
+            return None
+        times = pd.to_datetime(df["time"], errors="coerce")
+        try:
+            if times.dt.tz is not None:
+                times = times.dt.tz_convert("UTC").dt.tz_localize(None)
+        except AttributeError:
+            pass
+        df = df[(times > t0).to_numpy()].head(96)         # ~24h of M15
+        if len(df) == 0:
+            return None
+        hit_tp = ((df["high"] >= tp) if direction == 1
+                  else (df["low"] <= tp)).any()
+        hit_sl = ((df["low"] <= sl) if direction == 1
+                  else (df["high"] >= sl)).any()
+        if hit_tp and not hit_sl:
+            return "win"
+        if hit_sl:
+            return "loss"                          # SL-first on ties (conservative)
+        return None
+    except Exception:
+        return None
 
 def run_initial_training():
     force = getattr(config, 'FORCE_INITIAL_TRAINING', False)
@@ -128,6 +178,20 @@ def process_symbol_hf(symbol):
                     profit = deal['profit']
                     trade_logger.update_outcome(symbol, ticket, profit)
                     trades_since_retrain += 1
+                    # ── RARC Module 4: feed the cooldown matrix ──
+                    if rarc is not None:
+                        cd = rarc.on_trade_closed(symbol, ticket, profit)
+                        if cd["cooldown_started"]:
+                            event(f"RARC COOLDOWN STARTED {symbol} — "
+                                  f"{cd['streak_frame']} losses in "
+                                  f"{12}h frame; new entries blocked 12h")
+                            send(msg_error(f"🛑 {symbol}: RARC operational "
+                                           f"cooldown — {cd['streak_frame']} "
+                                           f"consecutive losses. Entries "
+                                           f"paused 12h."))
+                        elif cd["tier_changed"]:
+                            event(f"RARC tier {cd['tier']} (risk ×{cd['risk_mult']:.2f}) "
+                                  f"after {symbol} close {profit:+.2f}")
                     stats = trade_logger.get_stats()
                     event(f"CLOSE {symbol} #{ticket} → {'WIN' if profit>0 else 'LOSS'} "
                           f"{profit:+.2f} | WR {stats['winrate']:.0f}% ({stats['wins']}W-{stats['losses']}L)")
@@ -163,6 +227,13 @@ def process_symbol_hf(symbol):
             state['feature_cache'] = compute_features(df_base)
             state['cache_time'] = now
             state['last_signal_bar'] = cur_bar
+            # ── RARC: cheap ATR feed for the hourly regulator ──
+            if rarc is not None and state['feature_cache'] is not None:
+                _atr_col = state['feature_cache'].get('atr')
+                if _atr_col is not None:
+                    _last_atr = _atr_col.dropna()
+                    if len(_last_atr):
+                        rarc.note_atr(symbol, float(_last_atr.iloc[-1]))
 
     # 4. Smart Trade Manager (Every Loop with Rate Limit)
     if state['feature_cache'] is not None:
@@ -253,6 +324,36 @@ def execute_trade(symbol, decision, cur_bar):
     if spread_pct > config.MAX_SPREAD:
         return
 
+    # ── RARC safety stack (Modules 1-4) ──────────────────────
+    # Order inside pre_trade_gate: cooldown → friction → blindspot
+    # matrix → walk-forward smart gate. On pass it returns the
+    # BOUNDED effective Risk_Per_Trade and ATR-regulated SL/TP
+    # distance factors. Fail-open by design (see RARC_ARCHITECTURE.md).
+    rarc_gate = None
+    if rarc is not None:
+        now_utc = datetime.now(timezone.utc)
+        rarc_gate = rarc.pre_trade_gate(
+            symbol, spread_pct,
+            hour_utc=now_utc.hour, day_of_week=now_utc.weekday(),
+            atr_pct=float(signal.get('atr_pct', 0) or 0),
+            trend_strength=abs(float(signal.get('close_vs_ema', 0) or 0)),
+            session_active=1 if config.SESSION_START <= now_utc.hour < config.SESSION_END else 0,
+            now=now_utc)
+        if not rarc_gate.allowed:
+            is_smart = any(t.startswith("smart_gate") for t in rarc_gate.tags)
+            signal_log.log(f"{symbol}:rarc",
+                           f"● HOLD {symbol} {direction} — {rarc_gate.reason}")
+            if is_smart and atr:
+                # counterfactual shadow trade → feeds the live gate
+                # self-audit (auto-relaxes a gate that deletes edge)
+                est = float(signal.get('close', 0) or 0)
+                if est > 0:
+                    rarc.on_blocked_signal(
+                        symbol, 1 if direction == 'BUY' else -1, est,
+                        est - atr * 1.5, est + atr * 3.0,
+                        p_loss=rarc_gate.p_loss)
+            return
+
     # ── ML filter + pattern-match alerts (single source of truth) ──
     # The SR_H1 engine is validated WITHOUT the ML gate (duel parity) — the
     # SMC ML model was trained on M1 SMC features, not on H1 breakouts.
@@ -290,7 +391,9 @@ def execute_trade(symbol, decision, cur_bar):
         tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if direction == 'BUY' else tick.bid
         if decision.get('sl_price') is not None:
-            # SR_H1 engine (ENGINE C): level-based SL, TP at RR*R
+            # SR_H1 engine (ENGINE C): level-based SL, TP at RR*R.
+            # The LEVEL is structural — RARC's ATR regulator is NOT
+            # applied to level SLs (only the RR-scaled TP breathes).
             sl = float(decision['sl_price'])
             sl_dist = abs(price - sl)
             max_sl = getattr(config, 'SR_MAX_SL_ATR', 2.2) * atr
@@ -302,13 +405,20 @@ def execute_trade(symbol, decision, cur_bar):
             rr = decision.get('rr', 2.0)
             tp = price + rr * sl_dist if direction == 'BUY' else price - rr * sl_dist
         else:
-            tp = round(price + (atr * decision['tp_mult'] if direction == 'BUY' else -atr * decision['tp_mult']), digits)
-            sl = round(price - (atr * decision['sl_mult'] if direction == 'BUY' else -atr * decision['sl_mult']), digits)
+            # RARC Module 2: expand/contract ATR distances with the
+            # hourly volatility regulator (bounded 0.75×–1.50×).
+            sl_m = decision['sl_mult'] * (rarc_gate.sl_mult if rarc_gate else 1.0)
+            tp_m = decision['tp_mult'] * (rarc_gate.tp_mult if rarc_gate else 1.0)
+            tp = round(price + (atr * tp_m if direction == 'BUY' else -atr * tp_m), digits)
+            sl = round(price - (atr * sl_m if direction == 'BUY' else -atr * sl_m), digits)
         sl = round(sl, digits)
         tp = round(tp, digits)
 
-        # Risk-based lot sizing (compounds as balance grows)
-        lot = risk_manager.calc_lot_size(symbol, price, sl, balance)
+        # Risk-based lot sizing — RARC supplies the BOUNDED effective
+        # Risk_Per_Trade (Module 1 ROR cap × Module 4 cooldown tier).
+        lot = risk_manager.calc_lot_size(
+            symbol, price, sl, balance,
+            risk_pct=(rarc_gate.risk_pct if rarc_gate else None))
 
         # Final safety gate — blocks NEW entries on loss-limit/drawdown/margin
         allowed, reason = risk_manager.can_open_new_trade(risk_state, symbol, lot)
@@ -332,8 +442,20 @@ def execute_trade(symbol, decision, cur_bar):
                                        'atr': atr, 'tf': chosen_tf})
             state['last_trade_bar'] = cur_bar
             trade_logger.log_trade(symbol, signal, price, tp, sl, spread_pct, ticket=pos_ticket)
+            # ── RARC Module 2: record actual fill friction ──────
+            if rarc is not None:
+                fill_p = price
+                _pf = get_position_by_ticket(pos_ticket)
+                if _pf is not None:
+                    try:
+                        fill_p = float(_pf.price_open)
+                    except (TypeError, AttributeError, ValueError):
+                        pass
+                rarc.on_fill(symbol, price, fill_p, spread_pct, atr=atr)
+                rarc.note_atr(symbol, atr)
             event(f"OPEN {symbol} {direction} #{pos_ticket} @ {price:.2f} | TF {chosen_tf} "
-                  f"| lot {lot} | SL {sl:.2f} TP {tp:.2f} | ML {ml_conf:.0%}")
+                  f"| lot {lot} | SL {sl:.2f} TP {tp:.2f} | ML {ml_conf:.0%}"
+                  + (f" | RARC risk {rarc_gate.risk_pct:.2f}%" if rarc_gate else ""))
             placed += 1
             time.sleep(0.1)
         else:
@@ -372,6 +494,8 @@ def main():
 
     run_initial_training()
     send(msg_bot_start(config.SYMBOLS))
+    if rarc is not None:
+        rarc.set_shadow_lookup(_rarc_shadow_lookup)
 
     try:
         while True:
@@ -386,6 +510,19 @@ def main():
             # Refresh risk state (day PnL, peak equity) and check milestones
             acc = get_account_info()
             risk_state.update(acc)
+
+            # ── RARC maintenance: hourly friction/ATR jobs, the
+            #    00:00 UTC walk-forward retrain, shadow-trade audits.
+            #    Time-budgeted, never raises, usually a no-op.
+            if rarc is not None:
+                _spread0 = None
+                if config.SYMBOLS:
+                    try:
+                        _spread0 = get_spread_percent(config.SYMBOLS[0])
+                    except Exception:
+                        _spread0 = None
+                rarc.run_due_maintenance(datetime.now(timezone.utc),
+                                         live_spread=_spread0)
             milestone = risk_manager.check_withdrawal_milestone(risk_state)
             if milestone:
                 event(f"MILESTONE — profit ${milestone['profit']:.2f}; "

@@ -65,11 +65,16 @@ def _round_to_step(value, step):
     return round(round(value / step) * step, 8)
 
 
-def calc_lot_size(symbol, entry, sl, balance):
+def calc_lot_size(symbol, entry, sl, balance, risk_pct=None):
     """
-    Size the position so the loss at SL ≈ RISK_PERCENT_PER_TRADE % of balance.
-    Falls back to config.LOT_SIZE if broker info is unavailable.
+    Size the position so the loss at SL ≈ risk_pct % of balance.
+    Falls back to config.RISK_PERCENT_PER_TRADE when risk_pct is None,
+    and to config.LOT_SIZE if broker info is unavailable.
     Returns a broker-valid lot (clamped to min/max/step).
+
+    RARC integration: the RARC engine passes its BOUNDED effective risk
+    here (Module 1 ROR cap × Module 4 cooldown tier). The override can
+    only ever be <= the configured baseline — enforced below.
     """
     fallback = config.LOT_SIZE
     if not getattr(config, "USE_RISK_BASED_LOT", False):
@@ -95,7 +100,16 @@ def calc_lot_size(symbol, entry, sl, balance):
     if loss_per_lot <= 0:
         return fallback
 
-    risk_money = balance * (config.RISK_PERCENT_PER_TRADE / 100.0)
+    # Effective risk %: RARC override if given, else configured baseline.
+    # Belt & suspenders: an override can never size ABOVE the baseline.
+    eff_pct = config.RISK_PERCENT_PER_TRADE
+    if risk_pct is not None:
+        try:
+            eff_pct = min(float(risk_pct), float(config.RISK_PERCENT_PER_TRADE))
+        except (TypeError, ValueError):
+            pass
+
+    risk_money = balance * (eff_pct / 100.0)
     raw_lot    = risk_money / loss_per_lot
 
     lot_min  = getattr(info, "volume_min",  0.01)
