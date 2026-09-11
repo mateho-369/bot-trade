@@ -35,6 +35,7 @@ from core.smc_engine     import compute_features, get_latest_signal
 from core.backtester     import run_backtest
 from core.trade_manager  import manage_open_trade
 from core.mtf_engine     import scan_all_timeframes, h1_trend_direction, h1_gate_ok
+from core.sr_engine      import scan_sr
 from core                import risk_manager
 from core.state_logger   import event, signal_log
 from ml.model            import SMCModel, TradeLogger
@@ -70,7 +71,9 @@ def fresh_state():
         'positions': [],   # list of {ticket, entry, tp, sl, direction}
         'feature_cache':   None,
         'cache_time':      datetime.min,
-        'last_mod_time':   0
+        'last_mod_time':   0,
+        'consumed':        {},   # SR engine: {day_ordinal: set((level, dir))}
+        'consumed_day':    -1,
     }
 
 symbol_state = {sym: fresh_state() for sym in config.SYMBOLS}
@@ -169,20 +172,44 @@ def process_symbol_hf(symbol):
                 manage_open_trade(symbol, pos_state, state['feature_cache'], ml_model)
                 state['last_mod_time'] = time.time() # Update after mod attempt
 
-    # 5. New Entry Scan — at most ONCE per new bar (whether or not a trade is
-    #    placed), so blocked entries don't cause a per-second scan/log storm.
+    # 5. New Entry Scan — at most ONCE per new bar of the engine's TF
+    #    (whether or not a trade is placed), so blocked entries don't cause a
+    #    per-second scan/log storm.
+    engine = getattr(config, 'ENTRY_ENGINE', 'SR_H1')
+    scan_tf = "H1" if engine == "SR_H1" else "M1"
+    cur_bar = _get_cur_bar(symbol, scan_tf)
     if cur_bar != state['last_scan_bar'] and len(state['positions']) < config.MAX_POSITIONS:
         state['last_scan_bar'] = cur_bar
-        if _in_session():
-            decision = scan_all_timeframes(symbol, get_candles)
+        if engine == "SR_H1":
+            # ENGINE C (duel winner): session+news filters live inside scan_sr
+            _refresh_consumed(state)
+            decision = scan_sr(
+                get_candles(symbol, "H1", count=320),
+                get_candles(symbol, "H4", count=200),
+                state['consumed'], symbol)
             if decision:
-                # v1.9 H1 trend gate — block entries against the H1 EMA trend
-                h1_dir = h1_trend_direction(get_candles(symbol, "H1", count=300))
-                if h1_gate_ok(decision['direction'], h1_dir):
-                    execute_trade(symbol, decision, cur_bar)
-                else:
-                    signal_log.log(f"{symbol}:h1",
-                                   f"● HOLD {symbol} {decision['direction']} — against H1 trend")
+                event(f"SR SIGNAL {symbol} {decision['direction']} {decision['summary']}")
+                execute_trade(symbol, decision, cur_bar)
+        else:
+            if _in_session():
+                decision = scan_all_timeframes(symbol, get_candles)
+                if decision:
+                    # v1.9 H1 trend gate — block entries against the H1 EMA trend
+                    h1_dir = h1_trend_direction(get_candles(symbol, "H1", count=300))
+                    if h1_gate_ok(decision['direction'], h1_dir):
+                        execute_trade(symbol, decision, cur_bar)
+                    else:
+                        signal_log.log(f"{symbol}:h1",
+                                       f"● HOLD {symbol} {decision['direction']} — against H1 trend")
+
+def _refresh_consumed(state):
+    """SR engine: keep per-day consumed-level sets, drop old days."""
+    today = datetime.utcnow().date().toordinal()
+    if state.get('consumed_day') != today:
+        state['consumed'] = {d: s for d, s in state.get('consumed', {}).items()
+                             if today - d <= 2}
+        state['consumed_day'] = today
+
 
 def execute_trade(symbol, decision, cur_bar):
     state = symbol_state[symbol]
@@ -227,7 +254,12 @@ def execute_trade(symbol, decision, cur_bar):
         return
 
     # ── ML filter + pattern-match alerts (single source of truth) ──
-    ml_ok, ml_conf = ml_model.predict(signal, spread_pct)
+    # The SR_H1 engine is validated WITHOUT the ML gate (duel parity) — the
+    # SMC ML model was trained on M1 SMC features, not on H1 breakouts.
+    if decision.get('engine') == 'SR_H1':
+        ml_ok, ml_conf = True, 1.0
+    else:
+        ml_ok, ml_conf = ml_model.predict(signal, spread_pct)
     if config.PATTERN_CLUSTERING_ENABLED:
         features = [float(signal.get(col, 0)) for col in ml_model.FEATURE_COLS]
         match = ml_model.match_pattern(features)
@@ -257,8 +289,23 @@ def execute_trade(symbol, decision, cur_bar):
     for i in range(n_pos):
         tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if direction == 'BUY' else tick.bid
-        tp = round(price + (atr * decision['tp_mult'] if direction == 'BUY' else -atr * decision['tp_mult']), digits)
-        sl = round(price - (atr * decision['sl_mult'] if direction == 'BUY' else -atr * decision['sl_mult']), digits)
+        if decision.get('sl_price') is not None:
+            # SR_H1 engine (ENGINE C): level-based SL, TP at RR*R
+            sl = float(decision['sl_price'])
+            sl_dist = abs(price - sl)
+            max_sl = getattr(config, 'SR_MAX_SL_ATR', 2.2) * atr
+            min_sl = getattr(config, 'SR_MIN_SL_ATR', 0.25) * atr
+            if not (min_sl <= sl_dist <= max_sl):
+                event(f"SKIP {symbol} {direction} — SL distance {sl_dist:.2f} outside "
+                      f"[{min_sl:.2f},{max_sl:.2f}]")
+                break
+            rr = decision.get('rr', 2.0)
+            tp = price + rr * sl_dist if direction == 'BUY' else price - rr * sl_dist
+        else:
+            tp = round(price + (atr * decision['tp_mult'] if direction == 'BUY' else -atr * decision['tp_mult']), digits)
+            sl = round(price - (atr * decision['sl_mult'] if direction == 'BUY' else -atr * decision['sl_mult']), digits)
+        sl = round(sl, digits)
+        tp = round(tp, digits)
 
         # Risk-based lot sizing (compounds as balance grows)
         lot = risk_manager.calc_lot_size(symbol, price, sl, balance)
@@ -296,9 +343,11 @@ def execute_trade(symbol, decision, cur_bar):
         send(msg_signal(symbol, direction, price, tp, sl, atr, signal.get('rsi', 0),
                         f"MTF x{placed}", ml_conf, lot * placed))
 
-def _get_cur_bar(symbol):
+def _get_cur_bar(symbol, timeframe="M1"):
     import MetaTrader5 as mt5
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 1, 1)
+    tf = {"M1": mt5.TIMEFRAME_M1, "H1": mt5.TIMEFRAME_H1,
+          "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15}.get(timeframe, mt5.TIMEFRAME_M1)
+    rates = mt5.copy_rates_from_pos(symbol, tf, 1, 1)
     return int(rates[0]['time']) if rates is not None and len(rates) > 0 else 0
 
 def _in_session():

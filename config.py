@@ -147,6 +147,29 @@ H1_EMA_LEN       = 50
 # Wider ATR → SL distance grows → spread becomes a smaller % of risk.
 MTF_PRIORITY_M15 = True
 
+# ── ENTRY ENGINE SELECTOR (v1.9.1) ───────────────────────────
+# "SR_H1"   = ENGINE C — the DUEL WINNER: daily/weekly S/R breakout on H1
+#             + momentum + H4 trend + news filter (see core/sr_engine.py).
+#             +0.015 R/trade, PF 1.15, max DD 4.0R on 2024-2025 real data.
+# "SMC_MTF" = your original SMC sweep/BOS engine (v1.9 with H1 gate).
+ENTRY_ENGINE     = "SR_H1"
+
+# ── SR_H1 engine parameters (the tested build — don't change to retest) ──
+SR_SWING_LEN       = 5      # pivot length for swing levels
+SR_ATR_LEN         = 14
+SR_H4_EMA_LEN      = 50     # H4 trend filter
+SR_LEVEL_ATR_RANGE = 1.0    # only levels within 1*ATR of price matter
+SR_CLUSTER_ATR     = 0.25   # cluster levels closer than 0.25*ATR
+SR_MOMENTUM_BODY   = 0.5    # breakout bar body must be >= 0.5*ATR
+SR_CLOSE_POS       = 0.6    # close in upper 40% of bar (false-breakout filter)
+SR_SL_ATR          = 0.25   # SL = level ∓ 0.25*ATR
+SR_RR              = 2.0    # take profit at 2R
+SR_MAX_SL_ATR      = 2.2    # skip if SL distance > 2.2*ATR (too wide)
+SR_MIN_SL_ATR      = 0.25   # skip if SL distance < 0.25*ATR (too tight)
+SR_LOOKBACK_DAYS   = 10     # swing levels older than 10 days are ignored
+SR_NEWS_START      = 12.5   # skip US news window (UTC hours)
+SR_NEWS_END        = 14.5
+
 # ── Logging ───────────────────────────────────────────────────
 LOG_PATH = "logs/bot.log"
 CRASH_LOG_PATH = "logs/crash.log"

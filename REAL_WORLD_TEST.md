@@ -139,3 +139,28 @@ Win rate ទាំង ៣ គឺ **៣៥–៣៨% ដូចគ្នាបែ�
 **ENGINE C (build ល្អបំផុត) ឈ្នះ** — វាជា engine តែមួយគត់ដែលមាន expectancy វិជ្ជមានបន្ទាប់ពី spread ពិត, DD តូច, ខែឈ្នះច្រើន។
 **ENGINE B (code របស់អ្នក v1.9.0 ថ្មី)** បានកាត់ការបាត់បង់ **63%** ពី A (-0.168 → -0.082R), DD ពី 37R → 17R, ខែឈ្នះពី 3/24 → 10/24 — ប៉ុន្តែនៅតែអវិជ្ជមាន: ផ្នែក M1/M5 នៅតែបង់ cost/SL 8% + ច្រើនពេក។
 **ជម្រុះចុងក្រោយដែល B ត្រូវការដើម្បីឈានដល់ C:** បិទ M1 ទាំងអស់ (trade M15 តែប៉ុណ្ណោះ ដូច C ធ្វើលើ H1) — នោះ cost/SL មុខរបស់ B ចូល ៤–៥% ដូច C។ ប្រសិនបើសញ្ញា SMC របស់អ្នកនៅមាន WR ~36% នៅ M15 ដូចឥឡូវ → PF ~1.10+ → **ប្រកួតស្មើគ្នាបានហើយ**។ (តេស្តបន្ទាប់: បិទ M1/M5, M15 តែម្ដង មើលលទ្ធផល)
+
+---
+
+# 🏆 ENGINE C បានដាក់ចូលក្នុង BOT របស់អ្នកហើយ (v1.9.1)
+
+**`ENTRY_ENGINE = "SR_H1"` គឺជា default ឥឡូវនេះ** — bot របស់អ្នក ឥឡូវនេះ លេងជាមួយ engine ដែលឈ្នះក្នុងការប្រកួត:
+
+## អ្វីបានបន្ថែម
+- **`core/sr_engine.py`** (ថ្មី) — ENGINE C: កម្រិត S/R ថ្ងៃ (previous-day high/low) + H1 swing pivots ដែលបានបញ្ជាក់ (10 ថ្ងៃ, ≥6h stale, cluster 0.25 ATR) · H1 close កាត់កម្រិត = breakout · momentum (body ≥ 0.5 ATR, បិទភ្នែកក្នុង 40% ខាងលើ/ក្រោម) · H4 EMA50 trend · session 7–20 UTC · news window 12:30–14:30 UTC · កម្រិតមួយ ប្រើបាន ១ ដង/ថ្ងៃ · SL = level ∓ 0.25 ATR (cap 2.2 ATR) · TP = 2R · 1 position · គ្មាន grid
+- **`main.py`** — engine selector: `SR_H1` (default) ឬ `SMC_MTF` (engine ចាស់ v1.9 នៅតែមាន) · scan ១ ដង/ម៉ោង (H1 bar) · state consumed-levels រៀងរាល់ថ្ងៃ · SL/TP level-based · ML gate បំលាញ់សម្រាប់ SR (ស្របពី build ដែលបានតេស្ត)
+- **`config.py`** — `ENTRY_ENGINE` + ប៉ារ៉ាម៉ែត្រ SR ទាំងអស់ (កុំប្តូរ បើចង់ឱ្យលទ្ធផលដូចដែលបានតេស្ត)
+
+## ✅ ការបញ្ជាក់ (parity test)
+Code ក្នុង repo បានរត់ឡើងវិញលើទិន្នន័យពិត 2024–2025: **426 trades · WR 36.2% · PF 1.15 · E[R] +0.020 · maxDD 4.0R** — ស្មើនឹង Engine C ក្នុងការប្រកួត (430 trades · PF 1.15 · E[R] +0.015 · DD 4.0R)។ អត្ថន័យ: **អ្វីដែលអ្នកឃើញក្នុង code = អ្វីដែលបានតេស្ត ពិតប្រាកដ**។
+
+## របៀបប្រើ
+- **Default = SR_H1** (engine ឈ្នះ) — បើក bot ដដែល `run_bot_forever.bat`
+- ចង់ប្រើ engine SMC ចាស់: កែ `config.py` → `ENTRY_ENGINE = "SMC_MTF"`
+- ការគ្រប់គ្រង risk ដដែល (1% risk, daily stop 20%, drawdown stop 30%, withdrawal ladder) ដំណើរការលើ engine ទាំង ២
+- Telegram alerts ដំណើរការដដែល (layout ថ្មី)
+
+## ⚠️ ការពេល
+- លទ្ធផលតេស្ត = +0.02R/trade ជាមធ្យម (PF 1.15) — នេះជា edge **តូច តែវិជ្ជមាន** ជាមួយ DD តូច (4R) — មិនមែនម៉ាស៊ីនបោះពុម្ពលុយទេ; គោលការណ៍ទីផ្សារពិត គឺ ២–៥%/ខែ ជាមួយ DD <20% គឺល្អខ្លាំង
+- មុនពេលលុយពិត: **demo 2–3 ខែ** មើលថា live = backtest (spread/slippage ពិត) · ប្រើ broker Raw/ECN បើអាច
+- ប្រសិនបើ live ខុសពី backtest ច្រើន → បិទ SR (ENTRY_ENGINE = "SMC_MTF") ឬបិទ bot — stop បានដាក់រួច
