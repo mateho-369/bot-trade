@@ -1,0 +1,220 @@
+================================================================================
+BASELINE DERIVATION
+================================================================================
+Given WR=36.2% PF=1.15
+Derived avgWin (if avgLoss=1R): 2.0268R
+Gross E[R] = 0.0957R
+Net E[R] target = 0.0200R
+Implied avgWin_net for E[R]=0.02 with 1R loss: 1.8177R
+If win fixed 2.0R, loss needed for 0.02 E[R]: 1.1034R
+Typical SL = 1.5*ATR = 60.0 pips
+Typical TP = 3.0*ATR = 120.0 pips
+
+================================================================================
+1.1 MICRO-CENT FRICTION LIMIT ($50 -> 5000 cents)
+================================================================================
+Capital: $50.0 = 5000.0 cents
+Target risk: 1.0% = $0.5 = 50.0 cents
+Min lot 0.01 => pip value $0.1 = 10.0 cents
+
+SL (pips)  Risk $ (0.01 lot)  Risk % $50   Risk cents   Risk % 5000c  Min lot for 1%   Bal needed 1%  
+20         $2.00              4.00       % 200          4.00        % 0.00250          $200           
+40         $4.00              8.00       % 400          8.00        % 0.00125          $400           
+60         $6.00              12.00      % 600          12.00       % 0.00083          $600           
+88         $8.80              17.60      % 880          17.60       % 0.00057          $880           
+
+ANALYSIS:
+- For SL=20 pips, min risk = $2.00 = 4% of $50 capital -> violates 1% rule by 4x
+- For SL=88 pips (2.2 ATR cap), min risk = $8.80 = 17.6% of capital -> catastrophic over-leverage
+- Required balance to maintain 1% risk at 0.01 lot:
+  SL 20 pips -> $200 minimum
+  SL 40 pips -> $400 minimum
+  SL 60 pips -> $600 minimum
+  SL 88 pips -> $880 minimum
+- In cent account, same math holds: 20 pips = 200 cents = 4% of 5000c
+- Broker constraint: cannot go below 0.01 lot on standard cent. Need broker offering 0.001 lot (0.1 cent lots) or nano lots.
+- Structural solution: capital must be >= $200 for 20-pip SL, >= $880 for 88-pip SL to respect 1% rule at 0.01 lot.
+- If using 0.001 lot brokers (pip value $0.01), $50 can support 1% risk up to 50 pips SL.
+
+================================================================================
+1.2 WHALE MARKET IMPACT & EXECUTION DEGRADATION
+================================================================================
+Avg SL = 60.0 pips, Avg TP = 120.0 pips, RR=2.0
+
+Baseline Gross (no slip): PF=1.1500 E[R]=0.0957R (avgWin=2.027R)
+Baseline Net   (no slip): PF=1.0313 E[R]=0.0200R (avgWin=1.818R)
+
+Gross edge with 1.2000000000000002 pip total slippage:
+  Slip in R: 0.0200R, AdjWin: 2.0068R, AdjLoss: 1.0200R
+  Degraded PF: 1.1163, Degraded E[R]: 0.0757R
+
+Net edge (0.02R) with 1.2000000000000002 pip total slippage:
+  Slip in R: 0.0200R, AdjWin: 1.7977R, AdjLoss: 1.0200R
+  Degraded PF: 1.0000, Degraded E[R]: 0.0000R
+
+Non-linear slippage model: slip = 0.2 + 0.15*sqrt(lots)
+Lots     Slip pips    Slip R     PF_gross   E[R]_gross   PF_net     E[R]_net    
+1        0.350        0.0058     1.1400     0.0899       1.0221     0.0142      
+5        0.535        0.0089     1.1348     0.0868       1.0172     0.0111      
+10       0.674        0.0112     1.1309     0.0845       1.0136     0.0088      
+20       0.871        0.0145     1.1254     0.0812       1.0085     0.0055      
+30       1.022        0.0170     1.1212     0.0787       1.0046     0.0030      
+50       1.261        0.0210     1.1147     0.0747       0.9984     -0.0010     
+75       1.499        0.0250     1.1081     0.0707       0.9924     -0.0050     
+100      1.700        0.0283     1.1027     0.0674       0.9873     -0.0083     
+150      2.037        0.0340     1.0936     0.0617       0.9788     -0.0140     
+200      2.321        0.0387     1.0860     0.0570       0.9718     -0.0187     
+
+BREAKEVEN ANALYSIS:
+  Gross edge (0.095R) breakeven at 1000.0 lots, slippage 4.943 pips
+  Net edge (0.020R) breakeven at 44.4 lots, slippage 1.200 pips
+  Interpretation: If net edge is only 0.02R after typical spread, capacity is extremely low.
+  Using gross edge 0.095R before costs, capacity ~ 1000 lots per trade (~$1000000k notional per 1 lot =100oz gold).
+  Maximal scalable capacity for XAUUSD with this S/R breakout: ~50-75 lots before PF<1.15->1.0 degradation.
+  PF<1.0 breakeven Gross: 1000.0 lots, Net: 44.4 lots
+
+================================================================================
+1.3 PROP FIRM DRAWDOWN BOUNDARY TEST ($100k, 10% max, 5% daily)
+================================================================================
+
+--- Risk 1.0% per trade, Win=2.027R Loss=1R (Gross edge) ---
+Paths: 10000, Trades/path: 120, WR: 36.2%
+Prob >=5 consecutive losses: 99.81%
+Prob >=10 consecutive losses: 38.4800%
+Prob daily loss breach (5%): 0.00%
+Prob max DD breach (10%): 72.89%
+Median max DD: 12.95% (12.95R)
+95th percentile max DD: 26.36% (26.36R)
+Mean final return: 11.52%
+
+--- Risk 1.0% per trade, Win=1.818R Loss=1R (Net edge 0.02R) ---
+Prob >=5 consecutive losses: 99.67% (same WR)
+Prob >=10 consecutive losses: 37.7700%
+Prob daily loss breach (5%): 0.00%
+Prob max DD breach (10%): 82.94%
+Median max DD: 14.91% (14.91R)
+95th percentile max DD: 30.28%
+Mean final return: 2.24%
+
+--- Risk 2.0% per trade, Win=2.027R Loss=1R (Gross edge) ---
+Paths: 10000, Trades/path: 120, WR: 36.2%
+Prob >=5 consecutive losses: 99.69%
+Prob >=10 consecutive losses: 37.1800%
+Prob daily loss breach (5%): 0.00%
+Prob max DD breach (10%): 99.84%
+Median max DD: 25.84% (12.92R)
+95th percentile max DD: 51.41% (25.71R)
+Mean final return: 23.19%
+
+--- Risk 2.0% per trade, Win=1.818R Loss=1R (Net edge 0.02R) ---
+Prob >=5 consecutive losses: 99.76% (same WR)
+Prob >=10 consecutive losses: 38.1800%
+Prob daily loss breach (5%): 0.00%
+Prob max DD breach (10%): 99.97%
+Median max DD: 29.28% (14.64R)
+95th percentile max DD: 59.12%
+Mean final return: 5.25%
+
+Analytical streak probability (exact):
+P(at least 5 consecutive losses in 120 trades) = 99.73% (p_loss=0.638)
+P(at least 5 consecutive losses in 426 trades) = 100.00% (p_loss=0.638)
+P(at least 10 consecutive losses in 120 trades) = 37.86% (p_loss=0.638)
+P(at least 10 consecutive losses in 426 trades) = 82.96% (p_loss=0.638)
+
+================================================================================
+2.1 SPREAD-TO-ATR DEGRADATION THRESHOLD
+================================================================================
+ATR H1 avg 40 pips, SL typical 60.0 pips (1.5 ATR), max cap 88 pips (2.2 ATR)
+Commission assumption: $3.5 RT per lot ~ 0.35 pips for XAUUSD (conservative)
+
+Spread   Comm     TotalFric  Fric/SL60  Fric/SL88  Fric_R (60)  E[R] gross   E[R] net     PF gross   % Edge destroyed   Status
+0.5      0.35     0.85       1.42     % 0.97     % 0.0142       0.0815       0.0058       1.1260     14.8               
+1.0      0.35     1.35       2.25     % 1.53     % 0.0225       0.0732       -0.0025      1.1122     23.5               24% destroyed
+1.5      0.35     1.85       3.08     % 2.10     % 0.0308       0.0649       -0.0108      1.0986     32.2               32% destroyed
+2.0      0.35     2.35       3.92     % 2.67     % 0.0392       0.0565       -0.0192      1.0853     40.9               41% destroyed
+2.5      0.35     2.85       4.75     % 3.24     % 0.0475       0.0482       -0.0275      1.0721     49.6               50% destroyed
+3.0      0.35     3.35       5.58     % 3.81     % 0.0558       0.0399       -0.0358      1.0592     58.3               58% destroyed
+3.5      0.35     3.85       6.42     % 4.38     % 0.0642       0.0315       -0.0442      1.0464     67.0               67% destroyed
+
+Tipping point where E[R] gross becomes negative: spread ~ None pips (total friction ~ N/A pips)
+Exact breakeven spread (gross edge 0.095R): 5.39 pips (total 5.74 pips)
+Exact breakeven spread (net edge 0.02R): 0.85 pips (total 1.20 pips)
+
+Friction Ratio = (Spread+Commission)/SL
+For SL=60 pips, Friction Ratio at 0.5 pip spread = 1.42%
+For SL=20 pips tight SL, Friction Ratio at 0.5 pip = 4.25% -> much worse for tight stops
+Task's threshold: Friction Ratio exceeds 15% of expectancy
+15% of E[R]_gross (0.095R) = 0.0144R = 0.86 pips
+15% of E[R]_net (0.02R) = 0.0030R = 0.18 pips
+=> Even 0.5 pip spread destroys >15% of net edge if net edge only 0.02R, because 0.85 pips total =0.014R which is 70% of 0.02R
+
+================================================================================
+3.1 MEAN-REVERTING LOW-VOLATILITY TRAP (ADX<20 CHOP)
+================================================================================
+Chop regime assumed: WR=28.0% (vs 36.2% baseline), AvgWin=1.6R, PF=0.622, E[R]=-0.2720R
+Baseline ADX<20 condition typically 30-40% of time in summer doldrums
+
+Monte Carlo 10000 paths, 120 trades each:
+Metric                         Baseline             Chop ADX<20          Delta
+Mean Final R                   11.40                -32.71               -44.11
+Median Max DD (R)              12.95                36.80                23.85
+95th Max DD (R)                26.41                55.60                29.19
+99th Max DD (R)                33.60                62.80                29.20
+Mean Max Consec Loss (R)       9.22                 12.04                2.82
+Prob MaxDD >4R (baseline)      99.9                % 100.0               %
+Prob MaxDD >8R                 87.4                % 100.0               %
+
+Baseline reported MaxDD 4.0R is 99.9% likely to be exceeded in 120 trades even in trending regime
+In chop, median MaxDD 36.80R vs baseline median 12.95R -> 9.2x baseline reported DD
+
+================================================================================
+3.2 NEWS WINDOW FILTER EFFICIENCY VALIDATION (12:30-14:30 UTC)
+================================================================================
+Estimated news window trades if filter OFF: 63 (15% of baseline)
+News trades modeled: WR=30%, AvgWin=2.3R, AvgLoss=1.3R, PF=0.758, E[R]=-0.2200R
+Baseline: WR=36.2%, PF=1.15, E[R]_gross=0.0957R, E[R]_net=0.02R
+
+Combined (Filter OFF): Total trades=489, WR=35.40%, PF=1.0818, E[R]=0.0550R
+Filter ON (baseline): Trades=426, WR=36.20%, PF=1.1500, E[R]=0.0957R gross, 0.02R net
+
+Delta (OFF - ON): WR -0.80%, PF -0.0682, E[R] -0.0407R
+
+With extra slippage 1.0 pip in news (=0.0167R):
+News Adj PF=0.7432, Adj E[R]=-0.2367R
+Combined Adj (OFF with slippage): PF=1.0784, E[R]=0.0529R
+
+Alpha vs Destruction:
+  News gross profit (alpha): 43.47R
+  News gross loss (destruction): 57.33R
+  Net news PnL: -13.86R over 63 trades = -0.2200R/trade
+  Baseline net PnL: 40.77R over 426 trades = 0.0957R/trade
+  => News window is NEGATIVE expectancy, filter saves capital
+  After slippage: Net news -14.91R = -0.2367R/trade
+  => After slippage, news becomes toxic - filter is justified and saves from whipsaw
+
+Monte Carlo Filter Comparison (5000 paths, with slippage):
+  Filter ON final mean: 41.20R, median DD: 21.73R, 95th DD: 40.44R
+  Filter OFF final mean: 26.44R, median DD: 27.58R, 95th DD: 53.17R
+  Delta final: -14.76R
+  Delta median DD: +5.85R
+
+================================================================================
+UNIFIED COMPARISON MATRIX
+================================================================================
+                             Scenario  Total Trades      WR %       PF      E[R]   MaxDD R                                     Notes
+           Baseline (Engine C v1.9.1)           426 36.200000 1.150000  0.020000  4.000000                                 Reference
+       1.1 Micro-Cent $50 (20 pip SL)           426 36.200000 1.150000  0.020000  4.000000 Forced 4% risk (4x over), Bal needed $200
+        1.2 Whale 1 lots (slip 0.35p)           426 36.200000 1.140040  0.089867  4.023333             Net E[R]=0.014R, PF_net=1.022
+       1.2 Whale 50 lots (slip 1.26p)           426 36.200000 1.114658  0.074689  4.084044            Net E[R]=-0.001R, PF_net=0.998
+      1.2 Whale 100 lots (slip 1.70p)           426 36.200000 1.102681  0.067367  4.113333            Net E[R]=-0.008R, PF_net=0.987
+1.3 Prop 1% risk (Monte Carlo median)           120 36.200000 1.150000  0.095700 12.946409          P(DD>10%)=73.1%, P(5 cons)=99.7%
+1.3 Prop 2% risk (Monte Carlo median)           120 36.200000 1.150000  0.095700 12.946409          P(DD>10%)=99.8%, P(daily5%)=0.0%
+        2.1 Spread 0.5p (total 0.85p)           426 36.200000 1.126010  0.081533  4.028333           Net E[R]=0.006, FricRatio=1.42%
+        2.1 Spread 1.5p (total 1.85p)           426 36.200000 1.098631  0.064867  4.061667          Net E[R]=-0.011, FricRatio=3.08%
+        2.1 Spread 2.5p (total 2.85p)           426 36.200000 1.072123  0.048200  4.095000          Net E[R]=-0.028, FricRatio=4.75%
+        2.1 Spread 3.5p (total 3.85p)           426 36.200000 1.046445  0.031533  4.128333          Net E[R]=-0.044, FricRatio=6.42%
+             3.1 Chop ADX<20 (WR 28%)           120 28.000000 0.622222 -0.272000 36.800000  Median DD 36.8R vs 4.0R base, 95th 55.6R
+        3.2 News Filter ON (baseline)           426 36.200000 1.150000  0.095700 21.732044                  Filtered 12:30-14:30 UTC
+      3.2 News Filter OFF (with slip)           489 35.401227 1.078393  0.052880 27.578269         Delta E[R] -0.043, Delta DD +5.8R
+
+Saved matrix to stress_test_matrix.csv
