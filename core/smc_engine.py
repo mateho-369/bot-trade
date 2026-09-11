@@ -82,8 +82,13 @@ def compute_features(df):
     # ── Pivots ───────────────────────────────────────────────
     df['ph']       = calc_pivot_high(df['high'], config.SWING_LEN)
     df['pl']       = calc_pivot_low (df['low'],  config.SWING_LEN)
-    df['lastHigh'] = df['ph'].ffill()
-    df['lastLow']  = df['pl'].ffill()
+    # FIX: a pivot is only CONFIRMED SWING_LEN bars after it forms (the whole
+    # right side of the pivot must already exist). Without this shift the
+    # backtester was using pivots ~5 bars before they could be known —
+    # look-ahead bias that made results look better than live trading.
+    # With the shift, backtest timing == live timing (MT5/Pine style).
+    df['lastHigh'] = df['ph'].shift(config.SWING_LEN).ffill()
+    df['lastLow']  = df['pl'].shift(config.SWING_LEN).ffill()
 
     # ── Displacement ─────────────────────────────────────────
     df['body_size']    = (df['close'] - df['open']).abs()

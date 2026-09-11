@@ -186,8 +186,15 @@ class SMCModel:
 
             X = np.array([features])
             X_scaled = self.scaler.transform(X)
-            
-            prob = self.model.predict_proba(X_scaled)[0][1]
+
+            # FIX: resolve the WIN class index from the model instead of
+            # assuming [0][1] is "win" — if a retraining window ever contains
+            # only one class (e.g. only losses), [0][1] was the wrong column
+            # or an IndexError (which silently failed OPEN, letting everything
+            # through).
+            classes = list(self.model.classes_)
+            win_idx = classes.index(1) if 1 in classes else 0
+            prob = self.model.predict_proba(X_scaled)[0][win_idx]
 
             # Pattern override (nearest cluster center in scaled space)
             match = self.match_pattern(features)

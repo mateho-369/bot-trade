@@ -28,6 +28,12 @@ TF_MAP = {
 # ── CONNECTION ───────────────────────────────────────────────
 
 def connect():
+    if not config.MT5_LOGIN or not config.MT5_PASSWORD or not config.MT5_SERVER:
+        logger.error(
+            "MT5 credentials missing — set MT5_LOGIN / MT5_PASSWORD / MT5_SERVER "
+            "in the .env file (never commit real credentials to the repo)."
+        )
+        return False
     if not mt5.initialize():
         logger.error(f"MT5 initialize failed: {mt5.last_error()}")
         return False
@@ -238,15 +244,24 @@ def get_closed_trades(symbol, count=50):
     now   = datetime.now()
     # Fetch from last 7 days for efficiency, but filter for the count
     start = now - timedelta(days=7)
-    history = mt5.history_deals_get(start, now, group=f"*{symbol}*")
+    # FIX: the `group=` parameter of history_deals_get() is a BROKER COMPANY
+    # name — passing "*XAUUSD*" returned no deals at all, so closed trades were
+    # never detected: live win/loss outcomes were never logged, the ML never
+    # retrained on real trades, and open-position tracking could drop positions.
+    # Fetch by date range and filter the symbol ourselves.
+    history = mt5.history_deals_get(start, now)
     if history is None:
         return []
-    
+
+    sym_up = symbol.upper()
     trades = []
     for deal in reversed(history): # Get most recent first
         if deal.magic != 505001:
             continue
         if deal.entry != mt5.DEAL_ENTRY_OUT:
+            continue
+        deal_sym = (deal.symbol or "").upper()
+        if sym_up not in deal_sym and deal_sym not in sym_up:
             continue
         trades.append({
             "ticket":  deal.order,

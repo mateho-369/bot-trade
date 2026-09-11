@@ -1,5 +1,5 @@
 # ============================================================
-#   main.py  —  BOSS SMC BOT  v1.7.2
+#   main.py  —  BOSS SMC BOT  v1.8.0
 #   Deep Improvements: High-Freq Loop + Continuous Learning
 # ============================================================
 
@@ -193,6 +193,13 @@ def execute_trade(symbol, decision, cur_bar):
     if direction == 'SELL' and not config.ENABLE_SELL:
         return
 
+    # FIX: enforce the same COOLDOWN_BARS the backtest used. Previously
+    # last_trade_bar was stored but never checked, so live re-entered on the
+    # very next bar after a close — live behavior != validated behavior.
+    if state['last_trade_bar'] > 0 and \
+       (cur_bar - state['last_trade_bar']) < config.COOLDOWN_BARS * 60:
+        return
+
     # ── Volatility-regime guard (skip news-spike conditions) ──
     max_atr_pct = getattr(config, 'MAX_ATR_PCT', 0.0)
     if max_atr_pct > 0 and float(signal.get('atr_pct', 0)) > max_atr_pct:
@@ -227,10 +234,19 @@ def execute_trade(symbol, decision, cur_bar):
         return
 
     info = mt5.symbol_info(symbol)
+    if info is None:
+        event(f"SKIP {symbol} {direction} — symbol info not found (is it in Market Watch?)")
+        return
     digits = info.digits
     placed = 0
     price = tp = sl = 0.0
     lot = config.LOT_SIZE
+
+    # FIX: track the real POSITION tickets (MT5 manages positions, not order
+    # ids). Snapshot what's open now so we can identify the position we just
+    # opened — placing used to store result.order, which positions_get() never
+    # matches, so open trades could go unmanaged.
+    prior_tickets = {p.ticket for p in get_open_positions(symbol)}
 
     for i in range(n_pos):
         tick = mt5.symbol_info_tick(symbol)
@@ -251,12 +267,19 @@ def execute_trade(symbol, decision, cur_bar):
 
         ticket, err = (place_buy if direction == 'BUY' else place_sell)(symbol, lot, sl, tp, comment=f"BOSS {direction}")
         if ticket:
-            state['positions'].append({'ticket': ticket, 'entry': price, 'tp': tp, 'sl': sl,
+            # Resolve the actual position ticket (fall back to the order id)
+            new_pos = get_open_positions(symbol)
+            new_tickets = {p.ticket for p in new_pos} - prior_tickets
+            if len(new_tickets) == 1:
+                pos_ticket = new_tickets.pop()
+            else:
+                pos_ticket = ticket
+            state['positions'].append({'ticket': pos_ticket, 'entry': price, 'tp': tp, 'sl': sl,
                                        'direction': 1 if direction == 'BUY' else -1,
                                        'atr': atr, 'tf': chosen_tf})
             state['last_trade_bar'] = cur_bar
-            trade_logger.log_trade(symbol, signal, price, tp, sl, spread_pct, ticket=ticket)
-            event(f"OPEN {symbol} {direction} #{ticket} @ {price:.2f} | TF {chosen_tf} "
+            trade_logger.log_trade(symbol, signal, price, tp, sl, spread_pct, ticket=pos_ticket)
+            event(f"OPEN {symbol} {direction} #{pos_ticket} @ {price:.2f} | TF {chosen_tf} "
                   f"| lot {lot} | SL {sl:.2f} TP {tp:.2f} | ML {ml_conf:.0%}")
             placed += 1
             time.sleep(0.1)
@@ -285,7 +308,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v1.7.2  —  High-Freq Loop")
+    logger.info(f"  BOSS SMC BOT  v1.8.0  —  High-Freq Loop")
     logger.info("=" * 57)
 
     if not connect():

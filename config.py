@@ -12,8 +12,11 @@ except Exception:
     pass  # dotenv optional; falls back to defaults / real env vars below
 
 # ── MT5 Login ────────────────────────────────────────────────
-# Values come from environment / .env. The literals here are only
-# fallbacks so the bot still runs if you haven't set up .env yet.
+# FIX (security): real account credentials MUST NOT live in source code —
+# the old defaults (account 415…000 + its password) were committed to git.
+# Fill them in .env instead (see .env.example).
+# ⚠️ The old password and Telegram token were exposed — CHANGE the MT5
+# password and rotate the Telegram bot token before running again.
 def _int_env(name, default):
     """Read an int from env, tolerating blanks/placeholders (e.g. a fresh .env)."""
     try:
@@ -21,9 +24,9 @@ def _int_env(name, default):
     except (TypeError, ValueError):
         return int(default)
 
-MT5_LOGIN    = _int_env("MT5_LOGIN", 415699000)
-MT5_PASSWORD = os.getenv("MT5_PASSWORD", "369@Makara")
-MT5_SERVER   = os.getenv("MT5_SERVER",   "Exness-MT5Trial14")
+MT5_LOGIN    = _int_env("MT5_LOGIN", 0)
+MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
+MT5_SERVER   = os.getenv("MT5_SERVER",   "")
 
 # ── Symbols ──────────────────────────────────────────────────
 SYMBOLS = [
@@ -122,10 +125,11 @@ BLACKLIST_BLOCK_CONFIDENCE    = 0.40
 PATTERN_DATA_PATH             = f"{DATA_ROOT_PATH}/data/patterns.json"
 
 # ── Telegram Alerts ───────────────────────────────────────────
-# Token/chat come from .env — rotate the old token, it was in plaintext.
+# FIX (security): the hardcoded token was committed to git — it is revoked
+# material. Put a FRESH token in .env (BotFather → /revoke to rotate).
 TELEGRAM_ENABLED = True
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "8827286151:AAE35qWvKRmAgx5xArDzBWC0eKSAVW7vBhk")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "754349023")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Session Filter ────────────────────────────────────────────
 SESSION_FILTER = False
