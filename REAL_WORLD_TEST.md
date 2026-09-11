@@ -165,7 +165,7 @@ Code ក្នុង repo បានរត់ឡើងវិញលើទិន្
 - មុនពេលលុយពិត: **demo 2–3 ខែ** មើលថា live = backtest (spread/slippage ពិត) · ប្រើ broker Raw/ECN បើអាច
 - ប្រសិនបើ live ខុសពី backtest ច្រើន → បិទ SR (ENTRY_ENGINE = "SMC_MTF") ឬបិទ bot — stop បានដាក់រួច
 
-# 🧪 Sandbox Self-Test — Paper Auto-Trade ពេញលក្ខណៈ (v1.9.2)
+# 🧪 Sandbox Self-Test — Paper Auto-Trade ពេញលក្ខណៈ (v1.9.2 → v1.9.3)
 
 > រត់ដោយ **ខ្លួនឯង** ក្នុង sandbox (គ្មាន MT5 terminal, គ្មាន live feed) — ប្រើ **candle ពិត XAUUSD** + **broker សាក (fake MT5)** ដែលមាន API ដូច module `MetaTrader5` ពិត។ Bot ដែលរត់ = **`main.py` ពិត** របស់អ្នក (មិនមែន replica)។
 
@@ -174,8 +174,8 @@ Code ក្នុង repo បានរត់ឡើងវិញលើទិន្
 2. **Fake broker** — spread 0.25 (Exness-like) + slippage 0.05 · SL/TP ដកធានាដោយ broker **រាល់ tick ក្នុង M1 bar** (SL ត្រួតពិនិត្យមុន TP, តាម bid/ask ពិត) · min-stop validation (reject បើ SL ខ្ចាត់) · position ticket ពិត · deals history · account/margin ពិត។
 3. **Clock សាក** — bot មើល `datetime.now()` = ពេល replay · loop រត់ជាជំហាន 15 វិនាទី (management ក្រោយជាត្រឹម 15 នាទី; SL/TP ពិត ១០០% លើ tick គ្រប់ម៉ោង)។
 
-## ✅ Unit self-test: 27/27 PASS
-config គ្មាន secret · SMC pivot/sweep/BOS lag ត្រឹមត្រូវ · MTF decision + M15 priority + H1 gate · SR trigger + consumed per day · backtester next-bar-open · risk manager (lot sizing, 1-pos តាម balance, daily −20% halt, drawdown −30% halt, margin guard, withdrawal ladder) · ML train/predict + **single-class fail-closed** · state logger change-only · trade manager break-even 60% + signed progress (មិន trail លើ adverse) · connector (credentials required, forming bar skip, place→position ticket, min-stop, closed trades group fix, 7-day window)។
+## ✅ Unit self-test: 30/30 PASS
+config គ្មាន secret · SMC pivot/sweep/BOS lag ត្រឹមត្រូវ · MTF decision + M15 priority + H1 gate · SR trigger + consumed per day · backtester next-bar-open · risk manager (lot sizing, 1-pos តាម balance, daily −20% halt, drawdown −30% halt, margin guard, withdrawal ladder) · ML train/predict + **single-class fail-closed** · state logger change-only · trade manager break-even 60% + signed progress (មិន trail លើ adverse) · connector (credentials required, forming bar skip, place→position ticket, min-stop, closed trades group fix, 7-day window) · **restart/resume: re-adopt open positions + 30-day deal fallback + outcome log ពេញ**។
 
 ## 📊 លទ្ធផល Paper (luc $1,000, real candles 4.5 ខែ)
 | ម៉ូត | signals | ដាក់ | បិទ | WR | PF | E[R] | PnL | maxDD |
@@ -201,13 +201,15 @@ config គ្មាន secret · SMC pivot/sweep/BOS lag ត្រឹមត្�
 
 **ការរកឃើញ (honest):** parity backtest មាន H4 lookahead រមៀង — វាប្រើ H4 bar កំពុងបង្កើត ជាមួយតម្លៃចប់របស់វា (មិនអាចមានក្នុង live)។ ក្នុង window នេះ: parity មាន 102 signals ប៉ុន្តែ **9 ក្នុងនោះ មិនអាចកើតឡើងក្នុង bot ពិត** (ពឹងផ្អែកលើ lookahead) → **bot ពិត = 93 signals (stringent ជាង)**។ លទ្ធផល paper ខាងលើ = លទ្ធផលដែល live នឹងឃើញ។
 
-## 🐛 Bugs រកឃើញក្នុងការ self-test នេះ — បាន FIX រួច (v1.9.2)
+## 🐛 Bugs រកឃើញក្នុងការ self-test នេះ — បាន FIX រួច (v1.9.2 + v1.9.3)
 | កន្លែង | បញ្ហា | Fix |
 |---|---|---|
 | `main.py` | `datetime.utcnow()` — deprecated + crash loop ពេល datetime គ្មាន `utcnow` | `datetime.now(timezone.utc)` |
 | `ml/model.py` | model មើលឃើញ LOSS មិនឃើញ WIN ម្តង → `predict` **fail-open** (ចាយទាំងអស់!) | **fail-closed**: `return False, 0.0` រហូតដល់មាន WIN ក្នុង data |
 | `core/mt5_connector.py` | `place_buy/sell` ត្រឡប់ **order id** មិនមែន **position ticket** → open trade មិនត្រូវបានគ្រប់គ្រង (breakeven/trailing មិនដំណើរការ) | ត្រឡប់ position ticket ពិត (positions_get, fallback order id) |
 | `core/backtester.py` | crash បើ index name មិនមែន `time` | rename មុខងារដើម្បី defensive |
+| `main.py` (v1.9.3) | bot crash/restart → ទីតាំងដែលបើកពី run មុន **បាត់ពីការគ្រប់គ្រង** (គ្មាន breakeven/trailing, outcome មិន log) | `adopt_open_positions()` នៅពេល start — re-adopt ទីតាំងរបស់ bot (magic 505001) |
+| `get_closed_trades` + `main.py` (v1.9.3) | ទីតាំងដែល open **>7 ថ្ងៃ** → deal នៅខាងក្រៅ window 7 ថ្ងៃ → outcome បាត់ដោយស្ងាត់ (ML ខ្វះ data) | fallback 30 ថ្ងៃ + log `WARN` បើរកមិនឃើញ (មិន drop ស្ងាត់ទេ) |
 
 ## ⚠️ ការពេល (honest)
 - **Management ១៥ នាទី** — breakeven/trailing/SRTP-modify ក្រោយជាត្រឹម 15 នាទី (SL/TP មុនដើររាល់ tick មិនបាត់)។ Live ពិត loop រាប់វិនាទី → ល្អជាង paper

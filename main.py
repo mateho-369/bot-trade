@@ -1,5 +1,5 @@
 # ============================================================
-#   main.py  —  BOSS SMC BOT  v1.9.2
+#   main.py  —  BOSS SMC BOT  v1.9.3
 #   Deep Improvements: High-Freq Loop + Continuous Learning
 # ============================================================
 
@@ -106,6 +106,37 @@ def run_initial_training():
         if ml_model.train(combined):
             logger.info("✓ ML trained and ready!")
 
+def adopt_open_positions():
+    """Re-adopt positions left open by a previous (crashed/restarted) run.
+
+    Without this, trades opened before a restart would be invisible to the
+    bot: no break-even/trailing management, and their close outcome would
+    never be logged (step 1 only tracks tickets opened by this process).
+    The original atr/tf are unknown after restart — the manager falls back
+    to the live ATR (state.get('atr') or live_atr), which is safe.
+    """
+    import MetaTrader5 as mt5
+    adopted_total = 0
+    for symbol in config.SYMBOLS:
+        state = symbol_state[symbol]
+        known = {ps['ticket'] for ps in state['positions']}
+        for p in (get_open_positions(symbol) or []):
+            if p.ticket in known:
+                continue
+            direction = 1 if p.type == mt5.ORDER_TYPE_BUY else -1
+            state['positions'].append({
+                'ticket': p.ticket, 'entry': p.price_open, 'tp': p.tp,
+                'sl': p.sl, 'direction': direction, 'atr': 0.0, 'tf': 'H1',
+                'adopted': True})
+            known.add(p.ticket)
+            adopted_total += 1
+            event(f"ADOPT {symbol} {'BUY' if direction == 1 else 'SELL'} #{p.ticket} "
+                  f"@ {p.price_open:.2f} SL {p.sl:.2f} TP {p.tp:.2f} "
+                  f"(re-adopted after restart)")
+    if adopted_total:
+        logger.info(f"Re-adopted {adopted_total} open position(s) from previous run")
+    return adopted_total
+
 def process_symbol_hf(symbol):
     """High-frequency processing for a single symbol"""
     global trades_since_retrain, last_retrain_time
@@ -114,6 +145,7 @@ def process_symbol_hf(symbol):
 
     # 1. Update Closed Trades & Outcome
     closed_list = get_closed_trades(symbol, count=10)
+    deep_list = None   # lazy 30-day fallback (positions held longer than 7 days)
     all_mt5_pos = get_open_positions(symbol)
     tickets_in_mt5 = {p.ticket for p in all_mt5_pos}
 
@@ -122,20 +154,31 @@ def process_symbol_hf(symbol):
         ticket = pos_state['ticket']
         if ticket in tickets_in_mt5:
             still_open.append(pos_state)
-        else:
-            for deal in (closed_list or []):
-                if deal.get('position_id') == ticket:
-                    profit = deal['profit']
-                    trade_logger.update_outcome(symbol, ticket, profit)
-                    trades_since_retrain += 1
-                    stats = trade_logger.get_stats()
-                    event(f"CLOSE {symbol} #{ticket} → {'WIN' if profit>0 else 'LOSS'} "
-                          f"{profit:+.2f} | WR {stats['winrate']:.0f}% ({stats['wins']}W-{stats['losses']}L)")
-                    from core.state_logger import trade_log as _tl
-                    _tl.forget(ticket)  # stop tracking this ticket's progress line
-                    send(msg_closed(symbol, "BUY" if pos_state['direction'] == 1 else "SELL",
-                                   pos_state['entry'], deal['price'], profit, profit > 0, stats))
-                    break
+            continue
+        deal = next((d for d in (closed_list or [])
+                     if d.get('position_id') == ticket), None)
+        if deal is None:
+            # A wide-SL/TP position can stay open beyond the default 7-day
+            # deal window — retry once with 30 days before giving up.
+            if deep_list is None:
+                deep_list = get_closed_trades(symbol, count=50, days=30)
+            deal = next((d for d in (deep_list or [])
+                         if d.get('position_id') == ticket), None)
+        if deal is None:
+            # Never drop a position silently — outcome/ML data matters.
+            event(f"WARN {symbol} #{ticket} no longer open and no deal found "
+                  f"— outcome NOT logged (check broker history)")
+            continue
+        profit = deal['profit']
+        trade_logger.update_outcome(symbol, ticket, profit)
+        trades_since_retrain += 1
+        stats = trade_logger.get_stats()
+        event(f"CLOSE {symbol} #{ticket} → {'WIN' if profit>0 else 'LOSS'} "
+              f"{profit:+.2f} | WR {stats['winrate']:.0f}% ({stats['wins']}W-{stats['losses']}L)")
+        from core.state_logger import trade_log as _tl
+        _tl.forget(ticket)  # stop tracking this ticket's progress line
+        send(msg_closed(symbol, "BUY" if pos_state['direction'] == 1 else "SELL",
+                       pos_state['entry'], deal['price'], profit, profit > 0, stats))
     state['positions'] = still_open
 
     # 2. Continuous Learning (Rolling Window)
@@ -363,7 +406,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v1.9.2  —  High-Freq Loop")
+    logger.info(f"  BOSS SMC BOT  v1.9.3  —  High-Freq Loop")
     logger.info("=" * 57)
 
     if not connect():
@@ -371,6 +414,9 @@ def main():
         sys.exit(1) # Wrapper will restart
 
     run_initial_training()
+    # Re-adopt any open positions left by a previous (crashed/restarted) run,
+    # so they stay managed (break-even/trailing) and their outcome gets logged.
+    adopt_open_positions()
     send(msg_bot_start(config.SYMBOLS))
 
     try:

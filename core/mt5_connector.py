@@ -254,11 +254,16 @@ def get_position_by_ticket(ticket):
     return positions[0]
 
 
-def get_closed_trades(symbol, count=50):
-    """Fetch recent closed trades for the symbol"""
+def get_closed_trades(symbol, count=50, days=7):
+    """Fetch recent closed trades for the symbol (last `days` days).
+
+    Default window is 7 days for efficiency. Callers that track positions
+    which may be held longer than that (wide SL/TP) should widen it —
+    main.py falls back to days=30 for positions whose close deal it can't
+    find in the default window.
+    """
     now   = datetime.now()
-    # Fetch from last 7 days for efficiency, but filter for the count
-    start = now - timedelta(days=7)
+    start = now - timedelta(days=days)
     # FIX: the `group=` parameter of history_deals_get() is a BROKER COMPANY
     # name — passing "*XAUUSD*" returned no deals at all, so closed trades were
     # never detected: live win/loss outcomes were never logged, the ML never
