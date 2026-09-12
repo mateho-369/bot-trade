@@ -25,6 +25,10 @@ def run_backtest(df, symbol="SYMBOL", verbose=True):
     # Step 2: drop warmup rows (NaN from EMA/ATR/pivot calc)
     df_feat = df_feat.dropna(subset=['buy_signal','sell_signal','atr','ema'])
     df_feat = df_feat.reset_index(drop=False)  # keep time as column
+    # Defensive: the time column takes the name of whatever the index was
+    # (live MT5 data names it 'time'; lab data may differ)
+    if 'time' not in df_feat.columns:
+        df_feat = df_feat.rename(columns={df_feat.columns[0]: 'time'})
 
     if len(df_feat) == 0:
         logger.info(f"[{symbol}] No valid rows after warmup drop")
@@ -84,23 +88,44 @@ def run_backtest(df, symbol="SYMBOL", verbose=True):
         if not in_trade and can_trade:
             atr = float(row['atr'])
 
-            if buy_sig:
-                entry     = float(row['open'])
-                tp        = entry + atr * config.TP_MULT
-                sl        = entry - atr * config.SL_MULT
-                direction = 1
-                in_trade  = True
-                last_bar  = i
-                trades.append(_make_row(i, row, symbol, 'BUY', entry, tp, sl, atr))
+            # FIX: the signal on bar i is only KNOWN when bar i CLOSES, so a
+            # real trade can only be entered at bar i+1's open (live behaviour:
+            # MT5 confirms the bar, then the bot market-orders at the tick).
+            # The old code entered at bar i's open — before the signal existed
+            # (look-ahead). Same-bar exit check on the entry bar uses the same
+            # TP-first convention as the rest of this backtester.
+            if i + 1 < len(df_feat):
+                nxt      = i + 1
+                next_row = df_feat.iloc[nxt]
+                if buy_sig:
+                    entry     = float(next_row['open'])
+                    tp        = entry + atr * config.TP_MULT
+                    sl        = entry - atr * config.SL_MULT
+                    direction = 1
+                    in_trade  = True
+                    last_bar  = i
+                    trades.append(_make_row(nxt, next_row, symbol, 'BUY', entry, tp, sl, atr))
+                    if float(next_row['high']) >= tp:
+                        trades[-1]['outcome'] = 1; trades[-1]['pnl'] = tp - entry
+                        trades[-1]['close_bar'] = nxt; in_trade = False
+                    elif float(next_row['low']) <= sl:
+                        trades[-1]['outcome'] = 0; trades[-1]['pnl'] = sl - entry
+                        trades[-1]['close_bar'] = nxt; in_trade = False
 
-            elif sell_sig:
-                entry     = float(row['open'])
-                tp        = entry - atr * config.TP_MULT
-                sl        = entry + atr * config.SL_MULT
-                direction = -1
-                in_trade  = True
-                last_bar  = i
-                trades.append(_make_row(i, row, symbol, 'SELL', entry, tp, sl, atr))
+                elif sell_sig:
+                    entry     = float(next_row['open'])
+                    tp        = entry - atr * config.TP_MULT
+                    sl        = entry + atr * config.SL_MULT
+                    direction = -1
+                    in_trade  = True
+                    last_bar  = i
+                    trades.append(_make_row(nxt, next_row, symbol, 'SELL', entry, tp, sl, atr))
+                    if float(next_row['low']) <= tp:
+                        trades[-1]['outcome'] = 1; trades[-1]['pnl'] = entry - tp
+                        trades[-1]['close_bar'] = nxt; in_trade = False
+                    elif float(next_row['high']) >= sl:
+                        trades[-1]['outcome'] = 0; trades[-1]['pnl'] = entry - sl
+                        trades[-1]['close_bar'] = nxt; in_trade = False
 
     # ── Build results ─────────────────────────────────────────
     if len(trades) == 0:

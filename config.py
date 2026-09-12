@@ -12,8 +12,11 @@ except Exception:
     pass  # dotenv optional; falls back to defaults / real env vars below
 
 # ── MT5 Login ────────────────────────────────────────────────
-# Values come from environment / .env. The literals here are only
-# fallbacks so the bot still runs if you haven't set up .env yet.
+# FIX (security): real account credentials MUST NOT live in source code —
+# the old defaults (account 415…000 + its password) were committed to git.
+# Fill them in .env instead (see .env.example).
+# ⚠️ The old password and Telegram token were exposed — CHANGE the MT5
+# password and rotate the Telegram bot token before running again.
 def _int_env(name, default):
     """Read an int from env, tolerating blanks/placeholders (e.g. a fresh .env)."""
     try:
@@ -21,9 +24,9 @@ def _int_env(name, default):
     except (TypeError, ValueError):
         return int(default)
 
-MT5_LOGIN    = _int_env("MT5_LOGIN", 415699000)
-MT5_PASSWORD = os.getenv("MT5_PASSWORD", "369@Makara")
-MT5_SERVER   = os.getenv("MT5_SERVER",   "Exness-MT5Trial14")
+MT5_LOGIN    = _int_env("MT5_LOGIN", 0)
+MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
+MT5_SERVER   = os.getenv("MT5_SERVER",   "")
 
 # ── Symbols ──────────────────────────────────────────────────
 SYMBOLS = [
@@ -122,15 +125,73 @@ BLACKLIST_BLOCK_CONFIDENCE    = 0.40
 PATTERN_DATA_PATH             = f"{DATA_ROOT_PATH}/data/patterns.json"
 
 # ── Telegram Alerts ───────────────────────────────────────────
-# Token/chat come from .env — rotate the old token, it was in plaintext.
+# FIX (security): the hardcoded token was committed to git — it is revoked
+# material. Put a FRESH token in .env (BotFather → /revoke to rotate).
 TELEGRAM_ENABLED = True
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "8827286151:AAE35qWvKRmAgx5xArDzBWC0eKSAVW7vBhk")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "754349023")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Session Filter ────────────────────────────────────────────
-SESSION_FILTER = False
+# Engine duel (v1.9): Asia/low-liquidity hours hurt M1 signals.
+# London+NY window (UTC) — the window the best gold bots trade in.
+SESSION_FILTER = True
 SESSION_START  = 7
 SESSION_END    = 20
+
+# ── Engine v1.9 architecture filters (from engine-vs-engine duel) ──
+# Block new entries when they go AGAINST the H1 EMA trend.
+# The duel showed counter-trend M1 entries are the main bleed.
+H1_TREND_FILTER  = True
+H1_EMA_LEN       = 50
+# When an M15 signal exists, trade ONLY the M15 signal (ignore M1/M5 noise).
+# Wider ATR → SL distance grows → spread becomes a smaller % of risk.
+MTF_PRIORITY_M15 = True
+
+# ── ENTRY ENGINE SELECTOR (v1.9.1) ───────────────────────────
+# "SR_H1"   = ENGINE C — the DUEL WINNER: daily/weekly S/R breakout on H1
+#             + momentum + H4 trend + news filter (see core/sr_engine.py).
+#             +0.015 R/trade, PF 1.15, max DD 4.0R on 2024-2025 real data.
+# "SMC_MTF" = your original SMC sweep/BOS engine (v1.9 with H1 gate).
+# "FLASH"   = the ORIGINAL MTF high-freq flow (no session filter, no H1 gate)
+#             + 3 upgrades: tight-SL option, 50%-profit SL lock, opposite-side
+#             hedge flip (flatten pair when either leg hits). See
+#             core/flash_engine.py. 2024-2025 backtest (cost 0.30):
+#             original PF 0.87, +lock 0.85, +hedge 0.77, full 0.67 — all
+#             below 1.0 after costs, so this engine is OPT-IN, OFF by default.
+ENTRY_ENGINE     = "SR_H1"
+
+# ── FLASH engine parameters (ENTRY_ENGINE="FLASH" only) ──────────
+# Backtest of record: /home/user/backtest_lab/flash_mtf.py (730 days, cost 0.30,
+# SL-first, next-bar-open entries). R = initial stop distance of the pair.
+FLASH_SL_MULT       = 0.0   # U1 lose-small: 0.0 = per-TF default (1.5/1.8/2.0);
+                            #     1.0 = tighter initial stop (backtest: worse,
+                            #     PF 0.83 vs 0.87 — kept configurable anyway)
+FLASH_PROFIT_LOCK   = True  # U2: lock a share of profit once it runs
+FLASH_LOCK_TRIGGER  = 0.5   # trigger when profit >= 50% of the distance to TP
+FLASH_LOCK_PCT      = 0.5   # SL -> entry + 50% of current profit (ratchet)
+FLASH_HEDGE         = True  # U3: open opposite side when main leg goes wrong
+FLASH_HEDGE_TRIGGER = 0.5   # hedge when loss >= 50% of the main leg's risk
+FLASH_TIME_STOP     = 0     # U4: close the pair after N minutes (0 = off)
+FLASH_DAILY_STOP_R  = 3.0   # SAFETY: no new entries/hedges for the UTC day
+                            #     after -3R realized (backtest: caps worst day
+                            #     at ~-7R vs ~-70R uncapped)
+FLASH_ML_GATE       = False # backtest parity (ML model AUC 0.512 ≈ coin flip)
+
+# ── SR_H1 engine parameters (the tested build — don't change to retest) ──
+SR_SWING_LEN       = 5      # pivot length for swing levels
+SR_ATR_LEN         = 14
+SR_H4_EMA_LEN      = 50     # H4 trend filter
+SR_LEVEL_ATR_RANGE = 1.0    # only levels within 1*ATR of price matter
+SR_CLUSTER_ATR     = 0.25   # cluster levels closer than 0.25*ATR
+SR_MOMENTUM_BODY   = 0.5    # breakout bar body must be >= 0.5*ATR
+SR_CLOSE_POS       = 0.6    # close in upper 40% of bar (false-breakout filter)
+SR_SL_ATR          = 0.25   # SL = level ∓ 0.25*ATR
+SR_RR              = 2.0    # take profit at 2R
+SR_MAX_SL_ATR      = 2.2    # skip if SL distance > 2.2*ATR (too wide)
+SR_MIN_SL_ATR      = 0.25   # skip if SL distance < 0.25*ATR (too tight)
+SR_LOOKBACK_DAYS   = 10     # swing levels older than 10 days are ignored
+SR_NEWS_START      = 12.5   # skip US news window (UTC hours)
+SR_NEWS_END        = 14.5
 
 # ── Logging ───────────────────────────────────────────────────
 LOG_PATH = "logs/bot.log"

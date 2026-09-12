@@ -28,6 +28,12 @@ TF_MAP = {
 # ── CONNECTION ───────────────────────────────────────────────
 
 def connect():
+    if not config.MT5_LOGIN or not config.MT5_PASSWORD or not config.MT5_SERVER:
+        logger.error(
+            "MT5 credentials missing — set MT5_LOGIN / MT5_PASSWORD / MT5_SERVER "
+            "in the .env file (never commit real credentials to the repo)."
+        )
+        return False
     if not mt5.initialize():
         logger.error(f"MT5 initialize failed: {mt5.last_error()}")
         return False
@@ -142,6 +148,11 @@ def place_buy(symbol, lot, sl, tp, comment="BOSS BUY"):
     if (tp - price) < min_stop or (price - sl) < min_stop:
         return None, f"Stop too close (min_stop={min_stop:.5f})"
 
+    # Snapshot existing tickets so we can identify the position this order
+    # just created (picking max(p.time) is ambiguous when two positions —
+    # e.g. main + flash hedge — open in the same second).
+    prior = _ticket_set(symbol)
+
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       symbol,
@@ -167,7 +178,33 @@ def place_buy(symbol, lot, sl, tp, comment="BOSS BUY"):
             return None, f"Retcode:{result.retcode if result else '?'} {result.comment if result else ''}"
 
     logger.info(f"[{symbol}] BUY | Price:{price} TP:{tp} SL:{sl} Ticket:{result.order}")
-    return result.order, "OK"
+    return _resolve_new_ticket(symbol, prior, result), "OK"
+
+
+def _ticket_set(symbol):
+    try:
+        return {p.ticket for p in (mt5.positions_get(symbol=symbol) or ())}
+    except Exception:
+        return set()
+
+
+def _resolve_new_ticket(symbol, prior, result):
+    """Return the POSITION ticket created by a just-sent order.
+
+    Positions are managed by position id (the order id can differ). The
+    reliable way to find the new one is to diff the ticket set taken before
+    the order — picking max(p.time) is wrong when two positions share the
+    same open second (main + hedge)."""
+    new = _ticket_set(symbol) - prior
+    if len(new) == 1:
+        return new.pop()
+    try:
+        poss = mt5.positions_get(symbol=symbol)
+        if poss:
+            return max(poss, key=lambda p: p.time).ticket
+    except Exception:
+        pass
+    return getattr(result, "order", None)
 
 
 def place_sell(symbol, lot, sl, tp, comment="BOSS SELL"):
@@ -183,6 +220,8 @@ def place_sell(symbol, lot, sl, tp, comment="BOSS SELL"):
     min_stop = info.trade_stops_level * info.point
     if (price - tp) < min_stop or (sl - price) < min_stop:
         return None, f"Stop too close (min_stop={min_stop:.5f})"
+
+    prior = _ticket_set(symbol)
 
     request = {
         "action":       mt5.TRADE_ACTION_DEAL,
@@ -208,7 +247,7 @@ def place_sell(symbol, lot, sl, tp, comment="BOSS SELL"):
             return None, f"Retcode:{result.retcode if result else '?'} {result.comment if result else ''}"
 
     logger.info(f"[{symbol}] SELL | Price:{price} TP:{tp} SL:{sl} Ticket:{result.order}")
-    return result.order, "OK"
+    return _resolve_new_ticket(symbol, prior, result), "OK"
 
 
 def has_open_position(symbol):
@@ -233,20 +272,34 @@ def get_position_by_ticket(ticket):
     return positions[0]
 
 
-def get_closed_trades(symbol, count=50):
-    """Fetch recent closed trades for the symbol"""
+def get_closed_trades(symbol, count=50, days=7):
+    """Fetch recent closed trades for the symbol (last `days` days).
+
+    Default window is 7 days for efficiency. Callers that track positions
+    which may be held longer than that (wide SL/TP) should widen it —
+    main.py falls back to days=30 for positions whose close deal it can't
+    find in the default window.
+    """
     now   = datetime.now()
-    # Fetch from last 7 days for efficiency, but filter for the count
-    start = now - timedelta(days=7)
-    history = mt5.history_deals_get(start, now, group=f"*{symbol}*")
+    start = now - timedelta(days=days)
+    # FIX: the `group=` parameter of history_deals_get() is a BROKER COMPANY
+    # name — passing "*XAUUSD*" returned no deals at all, so closed trades were
+    # never detected: live win/loss outcomes were never logged, the ML never
+    # retrained on real trades, and open-position tracking could drop positions.
+    # Fetch by date range and filter the symbol ourselves.
+    history = mt5.history_deals_get(start, now)
     if history is None:
         return []
-    
+
+    sym_up = symbol.upper()
     trades = []
     for deal in reversed(history): # Get most recent first
         if deal.magic != 505001:
             continue
         if deal.entry != mt5.DEAL_ENTRY_OUT:
+            continue
+        deal_sym = (deal.symbol or "").upper()
+        if sym_up not in deal_sym and deal_sym not in sym_up:
             continue
         trades.append({
             "ticket":  deal.order,
@@ -262,3 +315,62 @@ def get_closed_trades(symbol, count=50):
         if len(trades) >= count:
             break
     return trades
+
+
+def modify_position(ticket, new_sl, new_tp):
+    """Modify an open position's SL/TP. Returns True on success."""
+    request = {
+        "action":   mt5.TRADE_ACTION_SLTP,
+        "position": int(ticket),
+        "sl":       round(float(new_sl), 5),
+        "tp":       round(float(new_tp), 5),
+    }
+    result = mt5.order_send(request)
+    if result is None:
+        logger.warning(f"Modify SLTP {ticket}: {mt5.last_error()}")
+        return False
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        logger.warning(f"Modify SLTP {ticket}: retcode {result.retcode} {result.comment}")
+        return False
+    return True
+
+
+def close_position(symbol, ticket):
+    """Close an open position at market (opposite side, same volume, no SL/TP).
+    Returns the exit price, or None on failure."""
+    pos = get_position_by_ticket(ticket)
+    if pos is None:
+        return None
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        return None
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        otype, price = mt5.ORDER_TYPE_SELL, tick.bid
+    else:
+        otype, price = mt5.ORDER_TYPE_BUY, tick.ask
+    request = {
+        "action":       mt5.TRADE_ACTION_DEAL,
+        "symbol":       symbol,
+        "volume":       float(pos.volume),
+        "type":         otype,
+        "price":        price,
+        "sl":           0.0,
+        "tp":           0.0,
+        "deviation":    50,
+        "magic":        505001,
+        "comment":      "FLASH CLOSE",
+        "position":     int(ticket),
+        "type_time":    mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(request)
+    if result is None:
+        logger.warning(f"Close {ticket}: {mt5.last_error()}")
+        return None
+    ok_codes = (mt5.TRADE_RETCODE_DONE,
+                getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))
+    if result.retcode not in ok_codes:
+        logger.warning(f"Close {ticket}: retcode {result.retcode} {result.comment}")
+        return None
+    logger.info(f"[{symbol}] Closed #{ticket} @ {price:.2f} ({pos.volume} lots)")
+    return price

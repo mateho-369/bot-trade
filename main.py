@@ -1,5 +1,5 @@
 # ============================================================
-#   main.py  —  BOSS SMC BOT  v1.7.2
+#   main.py  —  BOSS SMC BOT  v1.9.4
 #   Deep Improvements: High-Freq Loop + Continuous Learning
 # ============================================================
 
@@ -34,7 +34,9 @@ from core.mt5_connector  import (
 from core.smc_engine     import compute_features, get_latest_signal
 from core.backtester     import run_backtest
 from core.trade_manager  import manage_open_trade
-from core.mtf_engine     import scan_all_timeframes
+from core.mtf_engine     import scan_all_timeframes, h1_trend_direction, h1_gate_ok
+from core.sr_engine      import scan_sr
+from core                import flash_engine
 from core                import risk_manager
 from core.state_logger   import event, signal_log
 from ml.model            import SMCModel, TradeLogger
@@ -70,7 +72,9 @@ def fresh_state():
         'positions': [],   # list of {ticket, entry, tp, sl, direction}
         'feature_cache':   None,
         'cache_time':      datetime.min,
-        'last_mod_time':   0
+        'last_mod_time':   0,
+        'consumed':        {},   # SR engine: {day_ordinal: set((level, dir))}
+        'consumed_day':    -1,
     }
 
 symbol_state = {sym: fresh_state() for sym in config.SYMBOLS}
@@ -103,6 +107,63 @@ def run_initial_training():
         if ml_model.train(combined):
             logger.info("✓ ML trained and ready!")
 
+def adopt_open_positions():
+    """Re-adopt positions left open by a previous (crashed/restarted) run.
+
+    Without this, trades opened before a restart would be invisible to the
+    bot: no break-even/trailing management, and their close outcome would
+    never be logged (step 1 only tracks tickets opened by this process).
+    The original atr/tf are unknown after restart — the manager falls back
+    to the live ATR (state.get('atr') or live_atr), which is safe.
+    """
+    import MetaTrader5 as mt5
+    adopted_total = 0
+    for symbol in config.SYMBOLS:
+        state = symbol_state[symbol]
+        known = {ps['ticket'] for ps in state['positions']}
+        for p in (get_open_positions(symbol) or []):
+            if p.ticket in known:
+                continue
+            direction = 1 if p.type == mt5.ORDER_TYPE_BUY else -1
+            state['positions'].append({
+                'ticket': p.ticket, 'entry': p.price_open, 'tp': p.tp,
+                'sl': p.sl, 'direction': direction, 'atr': 0.0, 'tf': 'H1',
+                'volume': p.volume, 'adopted': True})
+            known.add(p.ticket)
+            adopted_total += 1
+            event(f"ADOPT {symbol} {'BUY' if direction == 1 else 'SELL'} #{p.ticket} "
+                  f"@ {p.price_open:.2f} SL {p.sl:.2f} TP {p.tp:.2f} "
+                  f"(re-adopted after restart)")
+    # FLASH: rebuild the pair (main + optional opposite hedge) from adopted
+    # positions so the pair stays managed across restarts.
+    if getattr(config, 'ENTRY_ENGINE', 'SR_H1') == 'FLASH' and adopted_total:
+        for symbol in config.SYMBOLS:
+            state = symbol_state[symbol]
+            if flash_engine.has_open_pair(state):
+                continue
+            adopted = [ps for ps in state['positions'] if ps.get('adopted')]
+            if not adopted:
+                continue
+            main = min(adopted, key=lambda ps: ps['ticket'])
+            hedge = next((ps for ps in adopted
+                          if ps['direction'] != main['direction']), None)
+            flash_engine.register_main(state, {
+                'ticket': main['ticket'], 'dir': main['direction'],
+                'entry': main['entry'], 'sl': main['sl'], 'tp': main['tp'],
+                'init_sl': main['sl'], 'lot': main.get('volume', config.LOT_SIZE),
+                'atr': 0.0, 'slm': 1.5, 'tpm': 3.0, 'opened_ts': time.time()})
+            if hedge is not None:
+                flash_engine._flash(state)['pair']['hedge'] = {
+                    'ticket': hedge['ticket'], 'dir': hedge['direction'],
+                    'entry': hedge['entry'], 'sl': hedge['sl'], 'tp': hedge['tp'],
+                    'init_sl': hedge['sl'], 'lot': hedge.get('volume', config.LOT_SIZE),
+                    'atr': 0.0, 'slm': 1.5, 'tpm': 3.0, 'opened_ts': time.time()}
+            event(f"FLASH ADOPT {symbol}: pair rebuilt "
+                  f"({'+hedge' if hedge else 'no hedge'}), hedges_used kept")
+    if adopted_total:
+        logger.info(f"Re-adopted {adopted_total} open position(s) from previous run")
+    return adopted_total
+
 def process_symbol_hf(symbol):
     """High-frequency processing for a single symbol"""
     global trades_since_retrain, last_retrain_time
@@ -111,6 +172,7 @@ def process_symbol_hf(symbol):
 
     # 1. Update Closed Trades & Outcome
     closed_list = get_closed_trades(symbol, count=10)
+    deep_list = None   # lazy 30-day fallback (positions held longer than 7 days)
     all_mt5_pos = get_open_positions(symbol)
     tickets_in_mt5 = {p.ticket for p in all_mt5_pos}
 
@@ -119,20 +181,31 @@ def process_symbol_hf(symbol):
         ticket = pos_state['ticket']
         if ticket in tickets_in_mt5:
             still_open.append(pos_state)
-        else:
-            for deal in (closed_list or []):
-                if deal.get('position_id') == ticket:
-                    profit = deal['profit']
-                    trade_logger.update_outcome(symbol, ticket, profit)
-                    trades_since_retrain += 1
-                    stats = trade_logger.get_stats()
-                    event(f"CLOSE {symbol} #{ticket} → {'WIN' if profit>0 else 'LOSS'} "
-                          f"{profit:+.2f} | WR {stats['winrate']:.0f}% ({stats['wins']}W-{stats['losses']}L)")
-                    from core.state_logger import trade_log as _tl
-                    _tl.forget(ticket)  # stop tracking this ticket's progress line
-                    send(msg_closed(symbol, "BUY" if pos_state['direction'] == 1 else "SELL",
-                                   pos_state['entry'], deal['price'], profit, profit > 0, stats))
-                    break
+            continue
+        deal = next((d for d in (closed_list or [])
+                     if d.get('position_id') == ticket), None)
+        if deal is None:
+            # A wide-SL/TP position can stay open beyond the default 7-day
+            # deal window — retry once with 30 days before giving up.
+            if deep_list is None:
+                deep_list = get_closed_trades(symbol, count=50, days=30)
+            deal = next((d for d in (deep_list or [])
+                         if d.get('position_id') == ticket), None)
+        if deal is None:
+            # Never drop a position silently — outcome/ML data matters.
+            event(f"WARN {symbol} #{ticket} no longer open and no deal found "
+                  f"— outcome NOT logged (check broker history)")
+            continue
+        profit = deal['profit']
+        trade_logger.update_outcome(symbol, ticket, profit)
+        trades_since_retrain += 1
+        stats = trade_logger.get_stats()
+        event(f"CLOSE {symbol} #{ticket} → {'WIN' if profit>0 else 'LOSS'} "
+              f"{profit:+.2f} | WR {stats['winrate']:.0f}% ({stats['wins']}W-{stats['losses']}L)")
+        from core.state_logger import trade_log as _tl
+        _tl.forget(ticket)  # stop tracking this ticket's progress line
+        send(msg_closed(symbol, "BUY" if pos_state['direction'] == 1 else "SELL",
+                       pos_state['entry'], deal['price'], profit, profit > 0, stats))
     state['positions'] = still_open
 
     # 2. Continuous Learning (Rolling Window)
@@ -162,21 +235,65 @@ def process_symbol_hf(symbol):
             state['last_signal_bar'] = cur_bar
 
     # 4. Smart Trade Manager (Every Loop with Rate Limit)
-    if state['feature_cache'] is not None:
-        now_ts = time.time()
-        if (now_ts - state['last_mod_time']) >= config.MIN_ORDER_INTERVAL_SECONDS:
+    engine = getattr(config, 'ENTRY_ENGINE', 'SR_H1')
+    now_ts = time.time()
+    if (now_ts - state['last_mod_time']) >= config.MIN_ORDER_INTERVAL_SECONDS:
+        if engine == "FLASH":
+            # FLASH owns its SL changes (profit lock / hedge / flatten)
+            if flash_engine.has_open_pair(state):
+                flash_engine.manage(symbol, state, risk_state)
+                state['last_mod_time'] = time.time()
+        elif state['feature_cache'] is not None:
             for pos_state in state['positions']:
                 manage_open_trade(symbol, pos_state, state['feature_cache'], ml_model)
                 state['last_mod_time'] = time.time() # Update after mod attempt
 
-    # 5. New Entry Scan — at most ONCE per new bar (whether or not a trade is
-    #    placed), so blocked entries don't cause a per-second scan/log storm.
+    # 5. New Entry Scan — at most ONCE per new bar of the engine's TF
+    #    (whether or not a trade is placed), so blocked entries don't cause a
+    #    per-second scan/log storm.
+    scan_tf = "H1" if engine == "SR_H1" else "M1"
+    cur_bar = _get_cur_bar(symbol, scan_tf)
     if cur_bar != state['last_scan_bar'] and len(state['positions']) < config.MAX_POSITIONS:
         state['last_scan_bar'] = cur_bar
-        if _in_session():
-            decision = scan_all_timeframes(symbol, get_candles)
+        if engine == "SR_H1":
+            # ENGINE C (duel winner): session+news filters live inside scan_sr
+            _refresh_consumed(state)
+            decision = scan_sr(
+                get_candles(symbol, "H1", count=320),
+                get_candles(symbol, "H4", count=200),
+                state['consumed'], symbol)
             if decision:
+                event(f"SR SIGNAL {symbol} {decision['direction']} {decision['summary']}")
                 execute_trade(symbol, decision, cur_bar)
+        elif engine == "FLASH":
+            # Original MTF high-freq flow (no session filter, no H1 gate) —
+            # one pair (main + optional hedge) at a time.
+            if _in_session() and not flash_engine.has_open_pair(state):
+                decision = flash_engine.decide(symbol, get_candles, state)
+                if decision:
+                    event(f"FLASH SIGNAL {symbol} {decision['direction']} "
+                          f"TF {decision.get('chosen_tf', '?')} {decision['signal'].get('rsi', 0):.0f}")
+                    execute_trade(symbol, decision, cur_bar)
+        else:
+            if _in_session():
+                decision = scan_all_timeframes(symbol, get_candles)
+                if decision:
+                    # v1.9 H1 trend gate — block entries against the H1 EMA trend
+                    h1_dir = h1_trend_direction(get_candles(symbol, "H1", count=300))
+                    if h1_gate_ok(decision['direction'], h1_dir):
+                        execute_trade(symbol, decision, cur_bar)
+                    else:
+                        signal_log.log(f"{symbol}:h1",
+                                       f"● HOLD {symbol} {decision['direction']} — against H1 trend")
+
+def _refresh_consumed(state):
+    """SR engine: keep per-day consumed-level sets, drop old days."""
+    today = datetime.now(timezone.utc).date().toordinal()
+    if state.get('consumed_day') != today:
+        state['consumed'] = {d: s for d, s in state.get('consumed', {}).items()
+                             if today - d <= 2}
+        state['consumed_day'] = today
+
 
 def execute_trade(symbol, decision, cur_bar):
     state = symbol_state[symbol]
@@ -191,6 +308,13 @@ def execute_trade(symbol, decision, cur_bar):
     if direction == 'BUY' and not config.ENABLE_BUY:
         return
     if direction == 'SELL' and not config.ENABLE_SELL:
+        return
+
+    # FIX: enforce the same COOLDOWN_BARS the backtest used. Previously
+    # last_trade_bar was stored but never checked, so live re-entered on the
+    # very next bar after a close — live behavior != validated behavior.
+    if state['last_trade_bar'] > 0 and \
+       (cur_bar - state['last_trade_bar']) < config.COOLDOWN_BARS * 60:
         return
 
     # ── Volatility-regime guard (skip news-spike conditions) ──
@@ -214,7 +338,16 @@ def execute_trade(symbol, decision, cur_bar):
         return
 
     # ── ML filter + pattern-match alerts (single source of truth) ──
-    ml_ok, ml_conf = ml_model.predict(signal, spread_pct)
+    # The SR_H1 engine is validated WITHOUT the ML gate (duel parity) — the
+    # SMC ML model was trained on M1 SMC features, not on H1 breakouts.
+    if decision.get('engine') == 'SR_H1':
+        ml_ok, ml_conf = True, 1.0
+    elif decision.get('engine') == 'FLASH' and not getattr(config, 'FLASH_ML_GATE', False):
+        # Backtest parity: the FLASH numbers in core/flash_engine.py were
+        # validated without the ML gate (AUC 0.512 ≈ coin flip).
+        ml_ok, ml_conf = True, 1.0
+    else:
+        ml_ok, ml_conf = ml_model.predict(signal, spread_pct)
     if config.PATTERN_CLUSTERING_ENABLED:
         features = [float(signal.get(col, 0)) for col in ml_model.FEATURE_COLS]
         match = ml_model.match_pattern(features)
@@ -227,16 +360,40 @@ def execute_trade(symbol, decision, cur_bar):
         return
 
     info = mt5.symbol_info(symbol)
+    if info is None:
+        event(f"SKIP {symbol} {direction} — symbol info not found (is it in Market Watch?)")
+        return
     digits = info.digits
     placed = 0
     price = tp = sl = 0.0
     lot = config.LOT_SIZE
 
+    # FIX: track the real POSITION tickets (MT5 manages positions, not order
+    # ids). Snapshot what's open now so we can identify the position we just
+    # opened — placing used to store result.order, which positions_get() never
+    # matches, so open trades could go unmanaged.
+    prior_tickets = {p.ticket for p in get_open_positions(symbol)}
+
     for i in range(n_pos):
         tick = mt5.symbol_info_tick(symbol)
         price = tick.ask if direction == 'BUY' else tick.bid
-        tp = round(price + (atr * decision['tp_mult'] if direction == 'BUY' else -atr * decision['tp_mult']), digits)
-        sl = round(price - (atr * decision['sl_mult'] if direction == 'BUY' else -atr * decision['sl_mult']), digits)
+        if decision.get('sl_price') is not None:
+            # SR_H1 engine (ENGINE C): level-based SL, TP at RR*R
+            sl = float(decision['sl_price'])
+            sl_dist = abs(price - sl)
+            max_sl = getattr(config, 'SR_MAX_SL_ATR', 2.2) * atr
+            min_sl = getattr(config, 'SR_MIN_SL_ATR', 0.25) * atr
+            if not (min_sl <= sl_dist <= max_sl):
+                event(f"SKIP {symbol} {direction} — SL distance {sl_dist:.2f} outside "
+                      f"[{min_sl:.2f},{max_sl:.2f}]")
+                break
+            rr = decision.get('rr', 2.0)
+            tp = price + rr * sl_dist if direction == 'BUY' else price - rr * sl_dist
+        else:
+            tp = round(price + (atr * decision['tp_mult'] if direction == 'BUY' else -atr * decision['tp_mult']), digits)
+            sl = round(price - (atr * decision['sl_mult'] if direction == 'BUY' else -atr * decision['sl_mult']), digits)
+        sl = round(sl, digits)
+        tp = round(tp, digits)
 
         # Risk-based lot sizing (compounds as balance grows)
         lot = risk_manager.calc_lot_size(symbol, price, sl, balance)
@@ -251,12 +408,26 @@ def execute_trade(symbol, decision, cur_bar):
 
         ticket, err = (place_buy if direction == 'BUY' else place_sell)(symbol, lot, sl, tp, comment=f"BOSS {direction}")
         if ticket:
-            state['positions'].append({'ticket': ticket, 'entry': price, 'tp': tp, 'sl': sl,
+            # Resolve the actual position ticket (fall back to the order id)
+            new_pos = get_open_positions(symbol)
+            new_tickets = {p.ticket for p in new_pos} - prior_tickets
+            if len(new_tickets) == 1:
+                pos_ticket = new_tickets.pop()
+            else:
+                pos_ticket = ticket
+            state['positions'].append({'ticket': pos_ticket, 'entry': price, 'tp': tp, 'sl': sl,
                                        'direction': 1 if direction == 'BUY' else -1,
                                        'atr': atr, 'tf': chosen_tf})
+            if decision.get('engine') == 'FLASH' and not flash_engine.has_open_pair(state):
+                flash_engine.register_main(state, {
+                    'ticket': pos_ticket, 'dir': 1 if direction == 'BUY' else -1,
+                    'entry': price, 'sl': sl, 'tp': tp, 'init_sl': sl,
+                    'lot': lot, 'atr': atr,
+                    'slm': decision['sl_mult'], 'tpm': decision['tp_mult'],
+                    'opened_ts': time.time()})
             state['last_trade_bar'] = cur_bar
-            trade_logger.log_trade(symbol, signal, price, tp, sl, spread_pct, ticket=ticket)
-            event(f"OPEN {symbol} {direction} #{ticket} @ {price:.2f} | TF {chosen_tf} "
+            trade_logger.log_trade(symbol, signal, price, tp, sl, spread_pct, ticket=pos_ticket)
+            event(f"OPEN {symbol} {direction} #{pos_ticket} @ {price:.2f} | TF {chosen_tf} "
                   f"| lot {lot} | SL {sl:.2f} TP {tp:.2f} | ML {ml_conf:.0%}")
             placed += 1
             time.sleep(0.1)
@@ -267,9 +438,11 @@ def execute_trade(symbol, decision, cur_bar):
         send(msg_signal(symbol, direction, price, tp, sl, atr, signal.get('rsi', 0),
                         f"MTF x{placed}", ml_conf, lot * placed))
 
-def _get_cur_bar(symbol):
+def _get_cur_bar(symbol, timeframe="M1"):
     import MetaTrader5 as mt5
-    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 1, 1)
+    tf = {"M1": mt5.TIMEFRAME_M1, "H1": mt5.TIMEFRAME_H1,
+          "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15}.get(timeframe, mt5.TIMEFRAME_M1)
+    rates = mt5.copy_rates_from_pos(symbol, tf, 1, 1)
     return int(rates[0]['time']) if rates is not None and len(rates) > 0 else 0
 
 def _in_session():
@@ -285,7 +458,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v1.7.2  —  High-Freq Loop")
+    logger.info(f"  BOSS SMC BOT  v1.9.4  —  High-Freq Loop")
     logger.info("=" * 57)
 
     if not connect():
@@ -293,6 +466,9 @@ def main():
         sys.exit(1) # Wrapper will restart
 
     run_initial_training()
+    # Re-adopt any open positions left by a previous (crashed/restarted) run,
+    # so they stay managed (break-even/trailing) and their outcome gets logged.
+    adopt_open_positions()
     send(msg_bot_start(config.SYMBOLS))
 
     try:

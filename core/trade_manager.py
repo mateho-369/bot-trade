@@ -59,9 +59,14 @@ def manage_open_trade(symbol, state, df_feat, ml_model):
     atr      = float(state.get('atr') or live_atr)
 
     # How far has price moved toward TP (as % of full TP distance)
-    tp_distance   = abs(tp - entry)
-    price_moved   = abs(current_price - entry) if direction == 1 else abs(entry - current_price)
-    progress_pct  = price_moved / tp_distance if tp_distance > 0 else 0
+    # FIX: must be SIGNED. The old abs() made a losing trade (price moving
+    # AWAY from TP) look "50-90% toward TP", which could trigger break-even /
+    # trailing / TP-tightening rules on the wrong side of entry.
+    tp_distance = abs(tp - entry)
+    if direction == 1:
+        progress_pct = (current_price - entry) / tp_distance if tp_distance > 0 else 0
+    else:
+        progress_pct = (entry - current_price) / tp_distance if tp_distance > 0 else 0
 
     # Current unrealized profit in price units
     if direction == 1:

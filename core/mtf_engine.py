@@ -36,6 +36,30 @@ TF_ATR_MULT = {
 }
 
 
+# ── v1.9: H1 TREND GATE ───────────────────────────────────────
+# The engine duel (same market, same costs) showed entries that go AGAINST
+# the H1 trend bleed ~10x more per trade. These functions are the single
+# source of truth used by main.py (live) and the backtest harness.
+def h1_trend_direction(df_h1, ema_len=None):
+    """Given an H1 OHLCV df (last confirmed bar last), return 'BUY' (uptrend),
+    'SELL' (downtrend) or None (not enough data)."""
+    span = ema_len or config.H1_EMA_LEN
+    if df_h1 is None or len(df_h1) < span + 5:
+        return None
+    ema = df_h1['close'].ewm(span=span, min_periods=span, adjust=False).mean()
+    last_ema = ema.iloc[-1]
+    if pd.isna(last_ema):
+        return None
+    return 'BUY' if df_h1['close'].iloc[-1] > last_ema else 'SELL'
+
+
+def h1_gate_ok(direction, h1_dir):
+    """True if the entry is allowed under the H1 trend filter."""
+    if not getattr(config, 'H1_TREND_FILTER', False) or h1_dir is None:
+        return True
+    return direction == h1_dir
+
+
 def scan_all_timeframes(symbol, connector_func):
     """
     Scans M1, M5, M15 for signals.
@@ -88,6 +112,15 @@ def _make_decision(symbol, results):
     Combines all TF signals into a trading decision.
     Returns decision dict or None.
     """
+    # ── v1.9: M15 PRIORITY — if an M15 signal exists, trade ONLY that ──
+    # M1/M5 become pure noise; the M15 ATR is ~2x wider so the SL distance
+    # grows and the broker spread becomes a smaller % of risk. In the engine
+    # duel this cut cost/SL from 11% → 8% and cut max drawdown nearly in half.
+    if getattr(config, 'MTF_PRIORITY_M15', False):
+        d15 = results.get('M15')
+        if d15 is not None and d15['signal'] is not None:
+            results = {'M15': d15}
+
     buy_score  = 0
     sell_score = 0
     signals_found = []
