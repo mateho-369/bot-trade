@@ -1,5 +1,5 @@
 # ============================================================
-#   main.py  —  BOSS SMC BOT  v1.9.3
+#   main.py  —  BOSS SMC BOT  v1.9.4
 #   Deep Improvements: High-Freq Loop + Continuous Learning
 # ============================================================
 
@@ -36,6 +36,7 @@ from core.backtester     import run_backtest
 from core.trade_manager  import manage_open_trade
 from core.mtf_engine     import scan_all_timeframes, h1_trend_direction, h1_gate_ok
 from core.sr_engine      import scan_sr
+from core                import flash_engine
 from core                import risk_manager
 from core.state_logger   import event, signal_log
 from ml.model            import SMCModel, TradeLogger
@@ -127,12 +128,38 @@ def adopt_open_positions():
             state['positions'].append({
                 'ticket': p.ticket, 'entry': p.price_open, 'tp': p.tp,
                 'sl': p.sl, 'direction': direction, 'atr': 0.0, 'tf': 'H1',
-                'adopted': True})
+                'volume': p.volume, 'adopted': True})
             known.add(p.ticket)
             adopted_total += 1
             event(f"ADOPT {symbol} {'BUY' if direction == 1 else 'SELL'} #{p.ticket} "
                   f"@ {p.price_open:.2f} SL {p.sl:.2f} TP {p.tp:.2f} "
                   f"(re-adopted after restart)")
+    # FLASH: rebuild the pair (main + optional opposite hedge) from adopted
+    # positions so the pair stays managed across restarts.
+    if getattr(config, 'ENTRY_ENGINE', 'SR_H1') == 'FLASH' and adopted_total:
+        for symbol in config.SYMBOLS:
+            state = symbol_state[symbol]
+            if flash_engine.has_open_pair(state):
+                continue
+            adopted = [ps for ps in state['positions'] if ps.get('adopted')]
+            if not adopted:
+                continue
+            main = min(adopted, key=lambda ps: ps['ticket'])
+            hedge = next((ps for ps in adopted
+                          if ps['direction'] != main['direction']), None)
+            flash_engine.register_main(state, {
+                'ticket': main['ticket'], 'dir': main['direction'],
+                'entry': main['entry'], 'sl': main['sl'], 'tp': main['tp'],
+                'init_sl': main['sl'], 'lot': main.get('volume', config.LOT_SIZE),
+                'atr': 0.0, 'slm': 1.5, 'tpm': 3.0, 'opened_ts': time.time()})
+            if hedge is not None:
+                flash_engine._flash(state)['pair']['hedge'] = {
+                    'ticket': hedge['ticket'], 'dir': hedge['direction'],
+                    'entry': hedge['entry'], 'sl': hedge['sl'], 'tp': hedge['tp'],
+                    'init_sl': hedge['sl'], 'lot': hedge.get('volume', config.LOT_SIZE),
+                    'atr': 0.0, 'slm': 1.5, 'tpm': 3.0, 'opened_ts': time.time()}
+            event(f"FLASH ADOPT {symbol}: pair rebuilt "
+                  f"({'+hedge' if hedge else 'no hedge'}), hedges_used kept")
     if adopted_total:
         logger.info(f"Re-adopted {adopted_total} open position(s) from previous run")
     return adopted_total
@@ -208,9 +235,15 @@ def process_symbol_hf(symbol):
             state['last_signal_bar'] = cur_bar
 
     # 4. Smart Trade Manager (Every Loop with Rate Limit)
-    if state['feature_cache'] is not None:
-        now_ts = time.time()
-        if (now_ts - state['last_mod_time']) >= config.MIN_ORDER_INTERVAL_SECONDS:
+    engine = getattr(config, 'ENTRY_ENGINE', 'SR_H1')
+    now_ts = time.time()
+    if (now_ts - state['last_mod_time']) >= config.MIN_ORDER_INTERVAL_SECONDS:
+        if engine == "FLASH":
+            # FLASH owns its SL changes (profit lock / hedge / flatten)
+            if flash_engine.has_open_pair(state):
+                flash_engine.manage(symbol, state, risk_state)
+                state['last_mod_time'] = time.time()
+        elif state['feature_cache'] is not None:
             for pos_state in state['positions']:
                 manage_open_trade(symbol, pos_state, state['feature_cache'], ml_model)
                 state['last_mod_time'] = time.time() # Update after mod attempt
@@ -218,7 +251,6 @@ def process_symbol_hf(symbol):
     # 5. New Entry Scan — at most ONCE per new bar of the engine's TF
     #    (whether or not a trade is placed), so blocked entries don't cause a
     #    per-second scan/log storm.
-    engine = getattr(config, 'ENTRY_ENGINE', 'SR_H1')
     scan_tf = "H1" if engine == "SR_H1" else "M1"
     cur_bar = _get_cur_bar(symbol, scan_tf)
     if cur_bar != state['last_scan_bar'] and len(state['positions']) < config.MAX_POSITIONS:
@@ -233,6 +265,15 @@ def process_symbol_hf(symbol):
             if decision:
                 event(f"SR SIGNAL {symbol} {decision['direction']} {decision['summary']}")
                 execute_trade(symbol, decision, cur_bar)
+        elif engine == "FLASH":
+            # Original MTF high-freq flow (no session filter, no H1 gate) —
+            # one pair (main + optional hedge) at a time.
+            if _in_session() and not flash_engine.has_open_pair(state):
+                decision = flash_engine.decide(symbol, get_candles, state)
+                if decision:
+                    event(f"FLASH SIGNAL {symbol} {decision['direction']} "
+                          f"TF {decision.get('chosen_tf', '?')} {decision['signal'].get('rsi', 0):.0f}")
+                    execute_trade(symbol, decision, cur_bar)
         else:
             if _in_session():
                 decision = scan_all_timeframes(symbol, get_candles)
@@ -300,6 +341,10 @@ def execute_trade(symbol, decision, cur_bar):
     # The SR_H1 engine is validated WITHOUT the ML gate (duel parity) — the
     # SMC ML model was trained on M1 SMC features, not on H1 breakouts.
     if decision.get('engine') == 'SR_H1':
+        ml_ok, ml_conf = True, 1.0
+    elif decision.get('engine') == 'FLASH' and not getattr(config, 'FLASH_ML_GATE', False):
+        # Backtest parity: the FLASH numbers in core/flash_engine.py were
+        # validated without the ML gate (AUC 0.512 ≈ coin flip).
         ml_ok, ml_conf = True, 1.0
     else:
         ml_ok, ml_conf = ml_model.predict(signal, spread_pct)
@@ -373,6 +418,13 @@ def execute_trade(symbol, decision, cur_bar):
             state['positions'].append({'ticket': pos_ticket, 'entry': price, 'tp': tp, 'sl': sl,
                                        'direction': 1 if direction == 'BUY' else -1,
                                        'atr': atr, 'tf': chosen_tf})
+            if decision.get('engine') == 'FLASH' and not flash_engine.has_open_pair(state):
+                flash_engine.register_main(state, {
+                    'ticket': pos_ticket, 'dir': 1 if direction == 'BUY' else -1,
+                    'entry': price, 'sl': sl, 'tp': tp, 'init_sl': sl,
+                    'lot': lot, 'atr': atr,
+                    'slm': decision['sl_mult'], 'tpm': decision['tp_mult'],
+                    'opened_ts': time.time()})
             state['last_trade_bar'] = cur_bar
             trade_logger.log_trade(symbol, signal, price, tp, sl, spread_pct, ticket=pos_ticket)
             event(f"OPEN {symbol} {direction} #{pos_ticket} @ {price:.2f} | TF {chosen_tf} "
@@ -406,7 +458,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v1.9.3  —  High-Freq Loop")
+    logger.info(f"  BOSS SMC BOT  v1.9.4  —  High-Freq Loop")
     logger.info("=" * 57)
 
     if not connect():

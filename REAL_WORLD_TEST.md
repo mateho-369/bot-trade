@@ -216,3 +216,29 @@ config គ្មាន secret · SMC pivot/sweep/BOS lag ត្រឹមត្�
 - **ទិន្នន័យហ្វុំដល់ 2025-12-31** — sandbox គ្មាន live feed; ខែកញ្ញា–ធ្នូ 2025 ជា **period ល្អ** របស់ engine (24 ខែពេញ = +0.02R/trade, មិនមែន +0.25R ទេ)
 - **`MAX_POSITIONS=3` (default) = stacking មិនទាន់បានតេស្ត** — build ដែលបានតេស្ត (duel + parity) គឺ 1 position; លទ្ធផល 1-pos ខាងលើ = អ្វីដែលបានបញ្ជាក់
 - Paper ល្អ ≠ live ធានា — ដំណាក់កាលបន្ទាប់: **demo 2–3 ខែ** ប្រៀបធៀប live vs paper នេះ (spread/slippage ពិត, execution រាប់វិនាទី)
+
+## ✦ v1.9.4 — FLASH engine (opt-in) + connector ticket fix
+
+**សំណាររបស់អ្នក (do it for me):** យក engine ដើម M1 ខ្ពស់ (main branch, គ្មាន session filter) បន្ថែម 3 មុខងារ:
+1. **Lose small** — SL តូចជាង (FLASH_SL_MULT)
+2. **Profit lock** — ពេលក្រេញដល់ ៥០% គឺ SL ផ្លេស់ទៅ lock ៥០% របស់ក្រេញ (FLASH_PROFIT_LOCK)
+3. **Hedge flip** — ពេល trade ខុសទិស ៥០% គឺ open ទិសផ្ទុយ តែង្វើបិទម្ខាងដាច់ → បិទទាំង pair ("take the one with profit, don't hold so long")
+
+**Backtest 24 ខែ (2024-01→2025-12, cost 0.30, SL-first, next-bar-open)** — `/home/user/backtest_lab/flash_mtf.py`:
+
+| បែប | trades | /ថ្ងៃ | WR | PF | E[R] | worst day |
+|---|---|---|---|---|---|---|
+| ដើម MTF (faithful) | 10,057 | 13.8 | 33.8% | **0.87** | −0.218 | −32R |
+| + profit lock | 13,102 | 17.9 | 39.0% | 0.85 | −0.230 | −36R |
+| + hedge flip | 12,354 | 16.9 | 27.0% | 0.77 | −0.341 | −42R (hedges 6,900 ដង) |
+| ទាំង 3 + daily stop −3R | 4,935 | 6.8 | 26.6% | 0.72 | −0.394 | **−6.8R** |
+| lock+hedge + daily stop | 5,803 | 7.9 | 33.3% | 0.78 | −0.275 | −6.5R |
+
+**សេចក្ដីសន្និដ្ឋាន (honest):** គ្មានបែបណា PF ≥ 1.0 ទេ — 3 មុខងារ **មិនបង្កើត edge** ឡើយ; hedge បង្កើត cost បន្ថែម (spread 2 ដង) + worst day ធ្ងន់ (−69R ដោយគ្មាន daily stop → −6.8R មាន daily stop)។ ដូច្នេះ FLASH **OFF by default** (`ENTRY_ENGINE="SR_H1"` ដដែល = duel winner PF 1.15) បើកបាន `ENTRY_ENGINE="FLASH"` ដើម្បី demo ប៉ុណ្ណោះ។
+
+**ការគាំពារមានក្នុង FLASH:** 1 pair/2 positions ប៉ុណ្ណោះ · `FLASH_DAILY_STOP_R=3` (បិទថ្ងៃបន្ទាប់នៅ −3R) · hedge តាម `risk_manager` (margin/drawdown) ដដែល · time stop ជ្រើសបាន · flatten ពេលម្ខាងដាច់។
+
+**Bug fix (real):** `place_buy`/`place_sell` ត្រឡប់ ticket ដោយ `max(p.time)` — ពេល 2 positions បើកក្នុង second ដដែល (main + hedge) វាជ្រើស **ticket ខុស** → ឥឡូវ diff ticket set មុន/ក្រោយ order (ដូច execute_trade)។ បានរកឃើញដោយ unit test T12។
+
+**Tests:** 34/34 PASS (30 ចាស់ + 4 FLASH ថ្មី: profit lock ratchet · hedge flip + flatten · daily stop · time stop)។
+**Paper smoke (real main.py, fake broker, 2025-09-01→09-14, $1000):** 36 trades ដំណើរការរលូន (5 hedges · 10 locks · 5 flattens · 0 crash · 0 untracked) — លទ្ធផល −13.3% ត្រូវនឹង backtest (engine ចាញ់)។

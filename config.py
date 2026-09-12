@@ -152,7 +152,30 @@ MTF_PRIORITY_M15 = True
 #             + momentum + H4 trend + news filter (see core/sr_engine.py).
 #             +0.015 R/trade, PF 1.15, max DD 4.0R on 2024-2025 real data.
 # "SMC_MTF" = your original SMC sweep/BOS engine (v1.9 with H1 gate).
+# "FLASH"   = the ORIGINAL MTF high-freq flow (no session filter, no H1 gate)
+#             + 3 upgrades: tight-SL option, 50%-profit SL lock, opposite-side
+#             hedge flip (flatten pair when either leg hits). See
+#             core/flash_engine.py. 2024-2025 backtest (cost 0.30):
+#             original PF 0.87, +lock 0.85, +hedge 0.77, full 0.67 — all
+#             below 1.0 after costs, so this engine is OPT-IN, OFF by default.
 ENTRY_ENGINE     = "SR_H1"
+
+# ── FLASH engine parameters (ENTRY_ENGINE="FLASH" only) ──────────
+# Backtest of record: /home/user/backtest_lab/flash_mtf.py (730 days, cost 0.30,
+# SL-first, next-bar-open entries). R = initial stop distance of the pair.
+FLASH_SL_MULT       = 0.0   # U1 lose-small: 0.0 = per-TF default (1.5/1.8/2.0);
+                            #     1.0 = tighter initial stop (backtest: worse,
+                            #     PF 0.83 vs 0.87 — kept configurable anyway)
+FLASH_PROFIT_LOCK   = True  # U2: lock a share of profit once it runs
+FLASH_LOCK_TRIGGER  = 0.5   # trigger when profit >= 50% of the distance to TP
+FLASH_LOCK_PCT      = 0.5   # SL -> entry + 50% of current profit (ratchet)
+FLASH_HEDGE         = True  # U3: open opposite side when main leg goes wrong
+FLASH_HEDGE_TRIGGER = 0.5   # hedge when loss >= 50% of the main leg's risk
+FLASH_TIME_STOP     = 0     # U4: close the pair after N minutes (0 = off)
+FLASH_DAILY_STOP_R  = 3.0   # SAFETY: no new entries/hedges for the UTC day
+                            #     after -3R realized (backtest: caps worst day
+                            #     at ~-7R vs ~-70R uncapped)
+FLASH_ML_GATE       = False # backtest parity (ML model AUC 0.512 ≈ coin flip)
 
 # ── SR_H1 engine parameters (the tested build — don't change to retest) ──
 SR_SWING_LEN       = 5      # pivot length for swing levels
