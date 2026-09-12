@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0"
 echo ============================================
 echo   BOSS SMC BOT - Installer
 echo ============================================
@@ -29,16 +30,15 @@ IF EXIST "venv\Scripts\activate.bat" (
         exit /b 1
     )
 )
-call venv\Scripts\activate.bat
 echo.
 
 REM --- 3. Upgrade pip ---
 echo Upgrading pip...
-python -m pip install --upgrade pip --quiet
+venv\Scripts\python.exe -m pip install --upgrade pip --quiet
 
 REM --- 4. Install everything from requirements.txt (single source of truth) ---
 echo Installing packages from requirements.txt ...
-pip install -r requirements.txt
+venv\Scripts\python.exe -m pip install -r requirements.txt
 IF %ERRORLEVEL% NEQ 0 (
     echo.
     echo [ERROR] Package installation failed. Check your internet connection
@@ -51,7 +51,7 @@ echo.
 
 REM --- 5. Verify the key imports actually load ---
 echo Verifying installation...
-python -c "import MetaTrader5, pandas, numpy, sklearn, telegram, dotenv, matplotlib; print('[OK] All core packages import correctly')"
+venv\Scripts\python.exe -c "import MetaTrader5, pandas, numpy, sklearn, telegram, dotenv, matplotlib; print('[OK] All core packages import correctly')"
 IF %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Some packages did not import. See the message above.
     pause
