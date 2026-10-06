@@ -38,6 +38,8 @@ from core.mtf_engine     import scan_all_timeframes, h1_trend_direction, h1_gate
 from core.sr_engine      import scan_sr
 from core                import flash_engine
 from core                import risk_manager
+from core.ai_review      import AIReviewer
+from core.ai_journal     import AIJournal
 from core.state_logger   import event, signal_log
 from ml.model            import SMCModel, TradeLogger
 from tg_alerts.alerts    import (send, msg_signal, msg_closed,
@@ -84,6 +86,18 @@ trade_logger         = TradeLogger()
 trades_since_retrain = 0
 last_retrain_time    = datetime.now()
 risk_state           = risk_manager.RiskState()
+
+# AI entry reviewer (feature-flagged). When AI_ENABLED is False the reviewer
+# is a no-op: it makes no provider call and writes no journal, so the bot
+# behaves exactly as before. See config.AI_* and core/ai_review.py.
+ai_reviewer = None
+if getattr(config, 'AI_ENABLED', False) and getattr(config, 'AI_PROVIDER', 'disabled') != 'disabled':
+    ai_journal  = AIJournal(config.AI_JOURNAL_PATH)
+    ai_reviewer = AIReviewer(ai_journal)
+    logger.info(f"AI entry review ENABLED (provider={config.AI_PROVIDER}, "
+                f"model={config.AI_MODEL}, min_conf={config.AI_MIN_CONFIDENCE})")
+else:
+    logger.info("AI entry review disabled — signals flow straight to risk checks")
 
 def run_initial_training():
     force = getattr(config, 'FORCE_INITIAL_TRAINING', False)
@@ -198,6 +212,13 @@ def process_symbol_hf(symbol):
             continue
         profit = deal['profit']
         trade_logger.update_outcome(symbol, ticket, profit)
+        # Link the reconciled closed-trade result back to the AI decision(s)
+        # that approved this entry (from the bot's OWN deal only).
+        if ai_reviewer is not None:
+            try:
+                ai_reviewer.journal.link_outcome(symbol, ticket, profit)
+            except Exception as e:
+                logger.error(f"AI journal link_outcome failed: {type(e).__name__}")
         trades_since_retrain += 1
         stats = trade_logger.get_stats()
         event(f"CLOSE {symbol} #{ticket} → {'WIN' if profit>0 else 'LOSS'} "
@@ -296,6 +317,61 @@ def _refresh_consumed(state):
 
 
 def execute_trade(symbol, decision, cur_bar):
+    """AI entry-review gate in FRONT of the existing deterministic path.
+
+    The strategy has already produced `decision`. When the AI reviewer is
+    enabled it reviews a sanitized decision-time snapshot and can only VETO:
+    a valid APPROVE lets the candidate CONTINUE to the unchanged deterministic
+    risk checks / order path in _execute_trade_inner; REJECT / WAIT and any AI
+    failure block it (fail-closed). The AI never places/cancels orders, sizes,
+    or moves stops. When disabled this is a transparent pass-through.
+    """
+    state = symbol_state[symbol]
+    signal = decision['signal']
+    atr = signal['atr']
+    chosen_tf = decision.get('chosen_tf', 'M1')
+    direction = decision['direction']
+
+    review = None
+    if ai_reviewer is not None and getattr(ai_reviewer, 'enabled', False):
+        try:
+            try:
+                spread_pct = get_spread_percent(symbol)
+            except Exception:
+                spread_pct = None
+            ctx = ai_reviewer.build_context(symbol, decision, signal, atr,
+                                            chosen_tf,
+                                            open_positions=len(state['positions']),
+                                            spread_pct=spread_pct)
+            review = ai_reviewer.review(ctx)
+        except Exception as e:
+            # Any unexpected AI-layer error fails CLOSED: block the candidate,
+            # never approve, never crash the loop. Log type only (no raw body).
+            logger.error(f"AI review error ({type(e).__name__}); "
+                         f"entry blocked (fail-closed)")
+            return
+        if not review.approved:
+            event(f"AI {review.action} {symbol} {direction} — {review.reason_code} "
+                  f"(conf {review.confidence:.2f}); entry blocked")
+            return
+        event(f"AI APPROVE {symbol} {direction} — {review.reason_code} "
+              f"(conf {review.confidence:.2f}) → risk checks")
+
+    block_reason = {'v': None}
+    try:
+        _execute_trade_inner(symbol, decision, cur_bar, review, block_reason)
+    finally:
+        # If the AI approved but the candidate never reached an order, record
+        # the deterministic outcome. A no-op if the candidate already executed.
+        if review is not None:
+            try:
+                ai_reviewer.journal.finalize_pending(
+                    review.decision_id, block_reason=block_reason['v'])
+            except Exception as e:
+                logger.error(f"AI journal finalize failed: {type(e).__name__}")
+
+
+def _execute_trade_inner(symbol, decision, cur_bar, review, block_reason):
     state = symbol_state[symbol]
     import MetaTrader5 as mt5
 
@@ -404,6 +480,8 @@ def execute_trade(symbol, decision, cur_bar):
             # change-only: logs when the block STARTS or the reason changes,
             # not every bar the signal persists
             signal_log.log(f"{symbol}:gate", f"● HOLD {symbol} — {reason}; skipping new entry")
+            if review is not None:
+                block_reason['v'] = f"risk_gate:{reason}"
             break
 
         ticket, err = (place_buy if direction == 'BUY' else place_sell)(symbol, lot, sl, tp, comment=f"BOSS {direction}")
@@ -427,6 +505,15 @@ def execute_trade(symbol, decision, cur_bar):
                     'opened_ts': time.time()})
             state['last_trade_bar'] = cur_bar
             trade_logger.log_trade(symbol, signal, price, tp, sl, spread_pct, ticket=pos_ticket)
+            if review is not None:
+                # AI approved AND the deterministic risk gate passed AND the
+                # order filled — link the decision to the real position ticket.
+                try:
+                    ai_reviewer.journal.mark_execution(
+                        review.decision_id, ticket=pos_ticket,
+                        risk_result="passed", execution="executed")
+                except Exception as e:
+                    logger.error(f"AI journal mark_execution failed: {type(e).__name__}")
             event(f"OPEN {symbol} {direction} #{pos_ticket} @ {price:.2f} | TF {chosen_tf} "
                   f"| lot {lot} | SL {sl:.2f} TP {tp:.2f} | ML {ml_conf:.0%}")
             placed += 1

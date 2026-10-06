@@ -24,6 +24,13 @@ def _int_env(name, default):
     except (TypeError, ValueError):
         return int(default)
 
+def _bool_env(name, default):
+    """Read a bool from env; anything not truthy (incl. blank) => default."""
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return bool(default)
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
 MT5_LOGIN    = _int_env("MT5_LOGIN", 0)
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER   = os.getenv("MT5_SERVER",   "")
@@ -192,6 +199,46 @@ SR_MIN_SL_ATR      = 0.25   # skip if SL distance < 0.25*ATR (too tight)
 SR_LOOKBACK_DAYS   = 10     # swing levels older than 10 days are ignored
 SR_NEWS_START      = 12.5   # skip US news window (UTC hours)
 SR_NEWS_END        = 14.5
+
+# ── AI Entry Review (feature-flagged — OFF by default) ─────────
+# An OPTIONAL AI risk-reviewer that sits in FRONT of the existing
+# deterministic risk checks (see execute_trade in main.py). It reviews a
+# candidate signal produced by the strategy and may APPROVE / REJECT / WAIT.
+#
+#   • The AI NEVER places or cancels orders, sizes positions, moves/removes
+#     stops, or bypasses any risk gate. A valid APPROVE only lets the
+#     candidate CONTINUE to the existing risk/order path below.
+#   • REJECT / WAIT and ANY AI failure (timeout, invalid JSON/schema, missing
+#     key, rate limit, provider error, open circuit) BLOCK the candidate —
+#     fail-closed. There is deliberately NO rule-based auto-approval fallback.
+#   • When AI_ENABLED=False the bot behaves EXACTLY as before and makes NO
+#     provider call and writes NO journal row.
+#
+# Only the minimum sanitized decision-time context is sent (no secrets, no
+# credentials, no account identifiers, no future bars). See core/ai_review.py.
+#
+# Enabling AI makes AI APPROVAL REQUIRED: if the provider/key is missing or
+# failing (timeout, invalid reply, rate limit, open circuit) new entries are
+# BLOCKED — fail-closed, never silently approved. Keep AI_ENABLED=false to
+# trade exactly as before with no provider call.
+AI_ENABLED               = _bool_env("AI_ENABLED", False)
+AI_PROVIDER              = os.getenv("AI_PROVIDER", "disabled")   # "openai_compat" | "disabled"
+# Any OpenAI-compatible chat-completions endpoint (OpenAI, Groq, Together,
+# a local vLLM/Ollama /v1 endpoint, ...). Never hardcode the key.
+AI_BASE_URL              = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
+AI_API_KEY               = os.getenv("AI_API_KEY", "")
+AI_MODEL                 = os.getenv("AI_MODEL", "gpt-4o-mini")
+AI_RESPONSE_FORMAT       = os.getenv("AI_RESPONSE_FORMAT", "json_object")  # or "json_schema"
+AI_TIMEOUT_SECONDS       = 8.0     # hard per-request timeout (bounded; never hangs the loop)
+AI_MAX_RETRIES           = 1       # bounded retries on availability errors (total attempts = 1 + this)
+AI_CIRCUIT_FAILURES      = 5       # open the circuit after this many consecutive availability failures
+AI_CIRCUIT_COOLDOWN_SECONDS = 120.0
+AI_MIN_CONFIDENCE        = 0.60    # an APPROVE below this confidence is treated as WAIT (fail-closed)
+AI_MAX_OUTPUT_TOKENS     = 300     # bound the reply size
+AI_JOURNAL_PATH          = f"{DATA_ROOT_PATH}/data/ai_decisions.csv"  # additive; same store as trade_log
+# Versions stamped into every prompt and journal row (bump when either changes).
+AI_SCHEMA_VERSION        = "entry_review_v1"
+AI_FEATURE_VERSION       = "sr_h1_v1"
 
 # ── Logging ───────────────────────────────────────────────────
 LOG_PATH = "logs/bot.log"
