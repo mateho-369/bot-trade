@@ -92,7 +92,7 @@ DISP_MULT     = 0.4
 # stop distance. The AI is asked for the same judgement — now the bot enforces
 # it deterministically too, so a missing/slow AI never pays 40% of R in spread.
 MAX_ATR_PCT = 0.0 if ULTRA_FAST else 0.9
-MAX_SPREAD_COST_PCT = 0.0 if ULTRA_FAST else 18.0
+MAX_SPREAD_COST_PCT = _float_env("MAX_SPREAD_COST_PCT", 0.0 if ULTRA_FAST else 18.0)
 
 # ── Circuit breaker ─────────────────────────────────────────
 CONSEC_LOSS_LIMIT     = 6 if ULTRA_FAST else 3
@@ -103,14 +103,15 @@ ATR_EXPANSION_BLOCK = 0.0 if ULTRA_FAST else 1.9   # x the 50-bar ATR average
 
 # ── Trade Settings ──────────────────────────────────────────
 LOT_SIZE      = _float_env("LOT_SIZE", 0.01)
-MAX_POSITIONS = 3 if ULTRA_FAST else 2
-MAX_SPREAD    = 0.08 if ULTRA_FAST else 0.05       # % of price
+MAX_POSITIONS = _int_env("MAX_POSITIONS", 3 if ULTRA_FAST else 2)
+MAX_SPREAD    = _float_env("MAX_SPREAD", 0.08 if ULTRA_FAST else 0.05)   # % of price
 ENABLE_BUY    = _bool_env("ENABLE_BUY", True)
 ENABLE_SELL   = _bool_env("ENABLE_SELL", True)
 
 # ── Risk Management ─────────────────────────────────────────
 USE_RISK_BASED_LOT     = True
-RISK_PERCENT_PER_TRADE = 1.0 if ULTRA_FAST else 0.5
+RISK_PERCENT_PER_TRADE = _float_env("RISK_PERCENT_PER_TRADE",
+                             1.0 if ULTRA_FAST else 0.5)
 SMALL_BALANCE_THRESHOLD = 50
 DAILY_MAX_LOSS_PERCENT = 25.0 if ULTRA_FAST else 6.0
 MAX_DRAWDOWN_PERCENT   = 40.0 if ULTRA_FAST else 15.0
@@ -122,7 +123,8 @@ WITHDRAW_MILESTONE_STEP    = _float_env("WITHDRAW_MILESTONE_STEP", 100)
 
 # ── Trailing: lock profit, then let the AI extend runners ───
 PROGRESSIVE_TRAIL      = True
-BREAK_EVEN_PROGRESS    = 0.30 if ULTRA_FAST else 0.45
+BREAK_EVEN_PROGRESS    = _float_env("BREAK_EVEN_PROGRESS",
+                           0.30 if ULTRA_FAST else 0.45)
 TRAIL_STAGE_1_PROGRESS = 0.30 if ULTRA_FAST else 0.45
 TRAIL_STAGE_2_PROGRESS = 0.50 if ULTRA_FAST else 0.60
 TRAIL_STAGE_3_PROGRESS = 0.70 if ULTRA_FAST else 0.80
@@ -228,19 +230,20 @@ AI_RESPONSE_FORMAT = _str_env("AI_RESPONSE_FORMAT", "json_object")
 
 # role 1 — entry gate (veto). Fail-CLOSED: no verdict = no trade.
 AI_ENABLED          = _bool_env("AI_ENABLED", False)
-AI_MIN_CONFIDENCE   = 0.60
+AI_MIN_CONFIDENCE   = _float_env("AI_MIN_CONFIDENCE", 0.60)
 # role 2 — position manager (HOLD / CLOSE / EXTEND). Fail-SAFE: no verdict
 # = keep the deterministic protections. Independent of role 1 since v2.1.
 AI_POSITION_ENABLED        = _bool_env("AI_POSITION_ENABLED", True)
 AI_POSITION_INTERVAL       = 300.0 if ULTRA_FAST else 900.0
-AI_POSITION_MIN_CONFIDENCE = 0.60
-AI_EXTEND_MIN_PROGRESS     = 0.85 if ULTRA_FAST else 0.90
-AI_EXTEND_TP_MULT          = 1.15
-AI_EXTEND_LOCK_PCT         = 0.80
+AI_POSITION_MIN_CONFIDENCE = _float_env("AI_POSITION_MIN_CONFIDENCE", 0.60)
+AI_EXTEND_MIN_PROGRESS     = _float_env("AI_EXTEND_MIN_PROGRESS",
+                                       0.85 if ULTRA_FAST else 0.90)
+AI_EXTEND_TP_MULT          = _float_env("AI_EXTEND_TP_MULT", 1.15)
+AI_EXTEND_LOCK_PCT         = _float_env("AI_EXTEND_LOCK_PCT", 0.80)
 AI_POSITION_SCHEMA_VERSION = "position_review_v2"
-AI_POSITION_VOTES          = 2      # both brains must agree on EXTEND
+AI_POSITION_VOTES          = _int_env("AI_POSITION_VOTES", 2)  # EXTEND needs agreement
 AI_POSITION_MODEL_2        = _str_env("AI_POSITION_MODEL_2", "")
-AI_POSITION_MAX_TOKENS     = 500
+AI_POSITION_MAX_TOKENS     = _int_env("AI_POSITION_MAX_TOKENS", 500)
 # role 3 — market adaptation / bot directives (bounded, clamped, expiring).
 AI_REGIME_ENABLED        = _bool_env("AI_REGIME_ENABLED", True)
 AI_REGIME_INTERVAL       = 3600.0 if ULTRA_FAST else 7200.0
@@ -248,13 +251,13 @@ AI_REGIME_MODEL          = _str_env("AI_REGIME_MODEL", "")
 AI_REGIME_SCHEMA_VERSION = "market_adaptation_v2"
 
 # shared transport / protection
-AI_TIMEOUT_SECONDS          = 8.0
-AI_MAX_RETRIES              = 1
-AI_CIRCUIT_FAILURES         = 5
-AI_CIRCUIT_COOLDOWN_SECONDS = 120.0
-AI_MAX_OUTPUT_TOKENS        = 400
+AI_TIMEOUT_SECONDS          = _float_env("AI_TIMEOUT_SECONDS", 8.0)
+AI_MAX_RETRIES              = _int_env("AI_MAX_RETRIES", 1)
+AI_CIRCUIT_FAILURES         = _int_env("AI_CIRCUIT_FAILURES", 5)
+AI_CIRCUIT_COOLDOWN_SECONDS = _float_env("AI_CIRCUIT_COOLDOWN_SECONDS", 120.0)
+AI_MAX_OUTPUT_TOKENS        = _int_env("AI_MAX_OUTPUT_TOKENS", 400)
 AI_JOURNAL_PATH             = f"{DATA_ROOT_PATH}/data/ai_decisions.csv"
-AI_JOURNAL_MAX_ROWS         = 20000   # prune beyond this (keeps the tail)
+AI_JOURNAL_MAX_ROWS         = _int_env("AI_JOURNAL_MAX_ROWS", 20000)
 AI_SCHEMA_VERSION           = "entry_review_v2"
 AI_FEATURE_VERSION          = _str_env("AI_FEATURE_VERSION",
                                        "sr_h1_v2" if not ULTRA_FAST else "smc_mtf_v2")
@@ -264,8 +267,8 @@ AI_FEATURE_VERSION          = _str_env("AI_FEATURE_VERSION",
 # never freeze break-even, trailing or trade reconciliation in the hot loop.
 AI_ASYNC                = _bool_env("AI_ASYNC", True)   # False = call AI inline (v2.0 behaviour, demo only)
 AI_WORKER_THREADS       = _int_env("AI_WORKER_THREADS", 1)
-AI_QUEUE_MAX            = 12      # extra candidates are refused (fail-closed)
-AI_RESULT_TTL_SECONDS   = 120.0   # a verdict older than this is discarded
+AI_QUEUE_MAX            = _int_env("AI_QUEUE_MAX", 12)   # extra work is refused
+AI_RESULT_TTL_SECONDS   = _float_env("AI_RESULT_TTL_SECONDS", 120.0)
 # Backpressure: when the queue is full the candidate is dropped AND the scan
 # backs off, so a rate-limited provider is not hammered every single bar.
 AI_QUEUE_BACKOFF_SECONDS = _float_env("AI_QUEUE_BACKOFF_SECONDS", 10.0)
@@ -274,13 +277,13 @@ AI_QUEUE_BACKOFF_SECONDS = _float_env("AI_QUEUE_BACKOFF_SECONDS", 10.0)
 AI_REJECT_COOLDOWN_SECONDS = _float_env("AI_REJECT_COOLDOWN_SECONDS", 45.0)
 # entry: a candidate waits at most this long for a verdict; older results are
 # dropped as STALE and a fresh scan re-arms.
-AI_ENTRY_MAX_AGE_SECONDS = 45.0
-AI_ENTRY_MAX_DRIFT_ATR   = 0.5
+AI_ENTRY_MAX_AGE_SECONDS = _float_env("AI_ENTRY_MAX_AGE_SECONDS", 45.0)
+AI_ENTRY_MAX_DRIFT_ATR   = _float_env("AI_ENTRY_MAX_DRIFT_ATR", 0.5)
 # position: CLOSE/EXTEND is applied only if the trade still looks like the one
 # the AI reviewed (progress moved less than this fraction).
-AI_POSITION_MAX_DRIFT_PROGRESS = 0.15
+AI_POSITION_MAX_DRIFT_PROGRESS = _float_env("AI_POSITION_MAX_DRIFT_PROGRESS", 0.15)
 AI_ENTRY_APPEAL               = _bool_env("AI_ENTRY_APPEAL", not ULTRA_FAST)
-AI_ENTRY_APPEAL_MIN_CONFIDENCE = 0.75
+AI_ENTRY_APPEAL_MIN_CONFIDENCE = _float_env("AI_ENTRY_APPEAL_MIN_CONFIDENCE", 0.75)
 
 # ── News (context for the AI + Telegram alerts) ──────────────
 NEWS_ENABLED       = _bool_env("NEWS_ENABLED", True)

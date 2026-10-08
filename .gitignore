@@ -13,4 +13,6 @@ SMC_Bot_Data/data/*.csv
 SMC_Bot_Data/models/*.pkl
 SMC_Bot_Data/data/risk_state.json
 SMC_Bot_Data/data/news_seen.json
+SMC_Bot_Data/data/ai_directives.json
+.env.bak
 SMC_Bot_Data/data/patterns.json

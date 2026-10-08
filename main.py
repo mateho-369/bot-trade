@@ -475,10 +475,33 @@ def apply_position_verdicts():
                 owner = (sym, ps, marked)
                 break
         if owner is None:
-            continue                      # swept/expired marker — nothing to do
+            # Marker was swept (its position closed and the close path cleared
+            # the ticket) or the verdict outlived its TTL. Still confirm the
+            # journal row when we know which ticket it was about.
+            if ai_position_reviewer is not None:
+                try:
+                    ai_position_reviewer.annotate_ticket(
+                        ticket, execution="not_applicable",
+                        final_action="ai_review_void_no_state",
+                        risk_result="not_reached")
+                except Exception:
+                    pass
+            continue
         sym, ps, marked = owner
         if ps is None:
-            continue                      # position closed while the AI thought
+            # Position closed while the AI was thinking. The advice is void —
+            # say so in the journal, otherwise the AI keeps a proposal that
+            # looks like it is still owed an outcome (v2.1 honesty rule).
+            if ai_position_reviewer is not None:
+                try:
+                    ai_position_reviewer.annotate(
+                        getattr(payload, 'decision_id', 0),
+                        execution="not_applicable",
+                        final_action="ai_review_void_position_gone",
+                        risk_result="not_reached")
+                except Exception:
+                    pass
+            continue
         if not ok:
             event(f"AI position review error for {sym} #{ticket} "
                   f"({type(payload).__name__}) — fail-safe HOLD")

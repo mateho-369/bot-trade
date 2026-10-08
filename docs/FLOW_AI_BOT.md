@@ -17,7 +17,7 @@
 | អ្វីដែលខ្ញុំកែ? | រចនាសម្ព័ន្ធឱ្យ AI ទទួលខុសត្រូវពិត: **bus ថ្មី + worker thread**, freshness re-check, តម្រឹម EXTEND រួមជាមួយ trade manager, **feedback ត្រឡប់ទៅ AI** (តួនាទី/កិច្ចសន្យា/កំហុស/ទិន្នន័យចុងក្រោយ), directives មានឥទ្ធិពលពិត, cost gate, តេស្ត **89** តែងតាំងជា ៤ បណ្តុំ |
 | AI ធ្វើឱ្យ bot មានប្រាក់ចំណេញទេ? | **មិនមែនជាការបញ្ចូល edge ទេ** — edge របស់ bot កំណត់ដោយ engine + TF + cost។ តាម `REAL_WORLD_TEST.md`: M1 (spread Exness) PF **0.69**, MTF ពេញលេញ PF **0.93** (−0.165R/ជួល), តែ **SR_H1 (H1) PF 1.15 · +0.02R · maxDD 4.0R**។ តួនាទី AI = **កាត់ការខាតបង់** (កុំចូលពេល spread ធំ, បិទទាន់ពេល, រក្សា BE) មិនមែនបង្កើតសញ្ញាថ្មីទេ |
 
-**លទ្ធផលសាកល្បង (v2.1):** `verify_ai_flow.py` 41 ✅ · `verify_ai_entry.py` 43 ✅ · `verify_fix.py` 2 ✅ · `verify_v17.py` 3 ✅ = **89 tests, all green** ។
+**លទ្ធផលសាកល្បង (v2.1):** `verify_ai_flow.py` 42 ✅ · `verify_ai_entry.py` 43 ✅ · `verify_fix.py` 2 ✅ · `verify_v17.py` 3 ✅ = **90 tests, all green** ។
 End-to-end ជាមួយ broker ក្លែងក្លាយ: SIGNAL → AI APPROVE → order → BE/trailing → AI EXTEND → AI CLOSE → journal បញ្ជាក់ **តាមពិត**។
 
 ---
@@ -35,7 +35,7 @@ flowchart TD
     S["🟦 យុទ្ធសាស្ត្រ: SR_H1 / SMC_MTF / FLASH"] --> E["execute_trade()"]
     E --> A["🔴 AIReviewer (inline)<br/>urlopen 8s × retry × appeal"]
     A -->|យឺត 5-10s| T0["loop 0.5s ក្លាយជា ~6-10s"]
-    T0 --> X["⚠️ trade_manager រំលងវគ្គ<br/>BE/trailing/close មិនដំណើរការ"]
+    T0 --> X["⚠️ trade_manager រំលងcycle<br/>BE/trailing/close មិនដំណើរការ"]
     A --> R["risk checks → order"]
     R --> P["position open"]
     P --> PR["🔴 PositionReviewer (inline, 2 votes)<br/>≤ 2×8s ក្នុងមួយ position"]
@@ -79,7 +79,7 @@ flowchart TD
         COL -->|OK| DR
         DR --> ORD["order → position"]
         ORD --> TM["🟩 trade_manager: BE · trailing · TP-tighten"]
-        ORD -.->|"≤1/វគ្គ ក្នុងមួយ position"| BUS2["AIBus.submit(position)"]
+        ORD -.->|"≤1/cycle ក្នុងមួយ position"| BUS2["AIBus.submit(position)"]
         TM -.->|"AI_EXTENDED → ឈប់កាត់ TP"| TM
         BUS2 --> COL2["apply_position_action()<br/>drift-progress guard 15%"]
         COL2 -->|"CLOSE"| CK["🟩 កត្តាទាំងអស់ (cooldown, markers, journal)"]
@@ -121,7 +121,7 @@ sequenceDiagram
     B->>B: bar ដដែល? drift ≤0.5 ATR? age ≤45s?
     B->>B: cost gate: spread ≤18% នៃ SL → ដាក់ order
     B->>T: គ្រប់គ្រង (BE 60% → lock +0.30, trail 0.5×ATR, tighten 2R→1.4R)
-    B->>U: submit POSITION (1 ក្នុងមួយវគ្គ ម្តង)
+    B->>U: submit POSITION (1 ក្នុងមួយ cycle)
     U->>AI: 2 votes (primary + second brain)
     AI-->>B: CLOSE / EXTEND / HOLD
     B->>T: EXTEND → ps['tp'] = 1.2×, lock 70% + AI_EXTENDED (T ឈប់ tighten)
@@ -147,7 +147,7 @@ sequenceDiagram
 |      AI EXTEND -> ps['tp'] updated + AI_EXTENDED -> Rule 4 stands down   |
 |   -> 1 position review per cycle -> CLOSE (blockers re-checked) or HOLD  |
 |   -> outcome -> journal.link_outcome + annotate(execution = truth)       |
-|   -> AI directives: 13 params, clamped to ranges, TTL 4h, persisted    |
+|   -> AI directives: 13 params, clamped to ranges, TTL 4h, persisted      |
 |--------------------------------------------------------------------------|
 | ai_context (cache 5s) feeds EVERY prompt:                                |
 |   management_contract()  = the real protections + real numbers           |
@@ -170,8 +170,8 @@ sequenceDiagram
 | 2 | `verify_ai_entry.py` ប៉ះទង្គិច (20/43) ព្រោះ fixture ប្រើ `XAUUSD` ខណៈ config = `EURUSD`; ការគណនា `client.last_key_number` ដោយគ្មានលក្ខខណ្ឌ | 🔴 | `state_for(symbol)` + guard លើ attribute | ទាំងស្រុង ✅ |
 | 3 | Prompt រៀបរាយការពារដែល build មិនមាន → AI វាយតម្លៃលើក្តីស្រមើល | 🔴 | `management_contract()` បង្កើតពី config ពិត (រាល់លេខមកពី build, មិនមែនអត្ថបទថេរ) | `TestManagementContract` |
 | 4 | HTTP ក្នុង thread loop (0.5s) → ការយឺតរបស់ AI សម្លាប់ការពារ | 🔴 | `core/ai_bus.py` worker + cache/dedupe/caps; bot មិនប្លុក | `TestLoopNeverBlocks` |
-| 5 | លទ្ធផលយឺតអាចបើកទីតានតាមតម្លៃចាស់ | 🟠 | freshness re-check (bar, 0.5 ATR, 45s) + re-arm marker; orphan marker រំលាយ | `TestStaleResultSafety` (4) |
-| 6 | AI `EXTEND` ត្រូវ TP-tighten លុបចោល | 🟠 | កែ `ps['tp']/ps['sl']` + `AI_EXTENDED` flag (ម្តង/ទីតាន) + ឈប់ tighten | `TestExtendVsRule4` |
+| 5 | លទ្ធផលយឺតអាចបើកទីតាំងតាមតម្លៃចាស់ | 🟠 | freshness re-check (bar, 0.5 ATR, 45s) + re-arm marker; orphan marker រំលាយ | `TestStaleResultSafety` (4) |
+| 6 | AI `EXTEND` ត្រូវ TP-tighten លុបចោល | 🟠 | កែ `ps['tp']/ps['sl']` + `AI_EXTENDED` flag (ម្តង/ទីតាំង) + ឈប់ tighten | `TestExtendVsRule4` |
 | 7 | `mark_execution` លាក់ `TypeError` ដោយស្ងាត់ (`ticket` ត្រូវតែមាន) → journal រក្សា `proposed` | 🟠 | `ticket=None` បាន + តេស្ត annotation | `TestJournalAnnotation` |
 | 8 | journal ប្រកាស `tp_extended` មុនពេលវាបានធ្វើ → AI រៀនពីរឿងកុហក | 🟠 | `_journal` សរសេរ `proposed`; រាល់ផ្លូវ ៧ ផ្លូវត្រូវបាន annotate ពិត | `test_extend_is_annotated_as_applied_not_asserted_upfront` |
 | 9 | ទិសតែមួយ: AI មិនដែលឃើញលទ្ធផលរបស់វា | 🔴 | `bot_results()` + `ai_lessons()` + `lessons_for_prompt()` បញ្ចូលក្នុង prompts ទាំង ៣ | `TestFeedbackIntoPrompts` |
@@ -183,14 +183,17 @@ sequenceDiagram
 | 15 | `AI_EXTEND_TP_MULT=1.4 / LOCK=0.6` ធ្ងន់ធ្ងរពេល → ងាយបិទមុនកំណត់ | 🟡 | 1.15 / 0.80 (កន្លះ 2R → យក 80%) | `TestExtendVsRule4` |
 | 16 | heartbeat មិនប្រាប់ថា AI កំពុងដំណើរការ/ទាញយកយឺត | 🟡 | បន្ថែម `AI-entry/-positions/-directives`, queue, engine, profile | `TestHonestSwitches` |
 | 17 | logger បំពេញសំរាម «Invalid TP» រាល់ 0.4s ក្នុង trade manager | 🟡 | change-only logging (`signal_log`) សម្រាប់ ៤ សារ + modify-failed | smoke run (60s: 88 → 0) |
+| 18 | មតិ AI ដែលមកដល់ក្រោយពេលទីតាំងត្រូវបានបិទ → គត់ «proposed» នៅក្នុង journal ជារៀងរហូត | 🟠 | `annotate_ticket()` + `annotate()` នៅគ្រប់ផ្លូវ (void_no_state / void_position_gone) → គ្រប់ row ត្រូវបានសម្រេច | `test_orphaned_verdict_is_annotated_by_ticket` |
+| 19 | គន្លឹះ risk/AI ជាច្រើនកំណត់តែក្នុង code → អ្នកត្រូវកែ config.py | 🟡 | គ្រប់ flag សំខាន់ (spread cost, risk%, positions, timeouts, extend, circuit) ឥឡូវអានពី `.env` + ឯកសារក្នុង `.env.example` | `preflight.py` បោះពុម្ពតម្លៃពិត |
+| 20 | រត់លើម៉ាស៊ីនថ្មី = ប៉ះទង្គិចស្ងាត់ (venv, .env placeholder, MT5 not running) | 🟡 | NEW `preflight.py` (+ ការហៅក្នុង run_bot.bat / run_bot_forever.bat) ត្រួតពិនិត្យ ៧ ផ្នែក មុនចាប់ផ្តើម; `--connect` សាក terminal ដោយមិនដាក់ order | ដំណើរការដោយខ្លួនឯង (exit 0/1) |
 
 ---
 
-## ៦) ល្បឿន — អ្វីដែលវាសនាសម្រាប់ការគ្រប់គ្រងទីតាន
+## ៦) ល្បឿន — អ្វីដែលវាសនាសម្រាប់ការគ្រប់គ្រងទីតាំង
 
 | លក្ខខណ្ឌ | v2.0 | v2.1 |
 |---|---|---|
-| រយៈពេល loop មធ្យម (AI ឆ្លើយតែ 2s) | ~2.0s (រាល់ AI call) | **1.0s** — ១០ វគ្គ < 0.05s (test) |
+| រយៈពេល loop មធ្យម (AI ឆ្លើយតែ 2s) | ~2.0s (រាល់ AI call) | **1.0s** — ១០ cycle < 0.05s (test) |
 | AI យឺត 8s × 2 votes × 4 symbols | 8-16s នៃការស្ងប់ស្ងាត់ (BE មិនដំណើរការ) | loop បន្ត; ការសម្រេចចិត្តចូលពេលវាដល់ |
 | AI queue ពេញ | n/a | បោះចោល + cooldown 10s (provider ស្ងប់) |
 | journal rewrite ក្នុងមួយ bar | O(rows) × រាល់ ២០ bar | ដដែល សម្រាប់ entry; position តែពេល proposal (តិច) |
@@ -240,14 +243,21 @@ sequenceDiagram
 
 ## ៩) វិធីផ្ទៀងផ្ទាត់ដោយខ្លួនឯង
 
+**ចាប់ផ្តើមលើ Windows:** សូមមើល `docs/RUN_ON_WINDOWS.md` (pull → install.bat → .env →
+`preflight.py` → `run_bot_forever.bat`)។ `preflight.py` ឆ្លើយសំណួរ «ខ្ញុំរត់បានហើយឬនៅ»
+ក្នុងមួយ command តែមួយ — packages, `.env` មិនទាន់លេខ, គណនី, ហានិភ័យ, AI wiring,
+ហើយ `--connect` សាក MT5 terminal ដោយ**មិនដាក់ order ឬកែអ្វីទាំងអស់**។
+
 ```bash
 # venv ត្រូវការ pandas/numpy (MT5 មិនចាំបាច់សម្រាប់ offline tests)
 python -m venv .venv && .venv/bin/pip install pandas numpy scikit-learn pytz python-dotenv
 
-.venv/bin/python verify_ai_flow.py     # 41 ✅  លំហូរ AI ⇄ bot (v2.1)
+.venv/bin/python verify_ai_flow.py     # 42 ✅  លំហូរ AI ⇄ bot (v2.1)
 .venv/bin/python verify_ai_entry.py    # 43 ✅  AI entry layer
 .venv/bin/python verify_fix.py           # 2 ✅  ការជួសជុលស្នូល
 .venv/bin/python verify_v17.py           # 3 ✅  cost/spread + session
+
+python preflight.py                    # ត្រួតពិនិត្យរចនាសម្ព័ន្ធក្នុង 1 command
 
 # MetaTrader5 មិនមាននៅលើ Linux/macOS — bot ដំណើរការតែ Windows/Wine។
 # រាល់តេស្តខាងលើដំណើរការក្រៅបណ្តាញ (no API keys, no terminal)។

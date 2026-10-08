@@ -553,6 +553,44 @@ class TestPositionLane(unittest.TestCase):
         self.assertNotEqual(jrn.mark_execution.call_args.kwargs.get("execution"),
                             "executed")
 
+    def test_orphaned_verdict_is_annotated_by_ticket(self):
+        """A verdict that lands after its position is gone (the close path
+        already swept the ticket marker) must not stay "proposed" forever."""
+        from core.ai_position import PositionReviewer
+        jrn = MagicMock()
+        jrn.record.return_value = 4242          # the journal row id
+        pr = PositionReviewer(jrn)
+        pr._client = MagicMock()
+        pr._client2 = MagicMock()
+        good = (json.dumps({"action": "EXTEND", "confidence": 0.9,
+                            "reason_code": "RUNNER", "reason": "x"}),
+                "m1", "openai_compat")
+        pr._client.complete.return_value = good
+        pr._client2.complete.return_value = good
+        pr.review({"symbol": "XAUUSD", "direction": "BUY", "extend_allowed": True},
+                  ticket=909)
+        before = len(jrn.mark_execution.mock_calls)
+        pr.annotate_ticket(909, execution="not_applicable",
+                           final_action="ai_review_void_no_state")
+        self.assertGreater(len(jrn.mark_execution.mock_calls), before,
+                           "the void outcome must reach the journal")
+        self.assertEqual(jrn.mark_execution.call_args.args[0], 4242)
+        self.assertEqual(jrn.mark_execution.call_args.kwargs["execution"],
+                         "not_applicable")
+        self.assertEqual(jrn.mark_execution.call_args.kwargs["final_action"],
+                         "ai_review_void_no_state")
+        # ...exactly once: an orphaned row is never annotated twice
+        n = len(jrn.mark_execution.mock_calls)
+        pr.annotate_ticket(909, execution="executed", final_action="dup")
+        self.assertEqual(len(jrn.mark_execution.mock_calls), n)
+        # forget() (position closed normally) drops the ticket mapping too
+        pr.review({"symbol": "XAUUSD", "direction": "BUY", "extend_allowed": True},
+                  ticket=910)
+        pr.forget(910)
+        m = len(jrn.mark_execution.mock_calls)
+        pr.annotate_ticket(910, execution="executed", final_action="dup")
+        self.assertEqual(len(jrn.mark_execution.mock_calls), m)
+
     def test_verdict_for_a_dead_position_is_ignored(self):
         main.ai_bus = AIBus(workers=1, queue_max=4).start()
         self.addCleanup(main.ai_bus.shutdown)

@@ -140,6 +140,10 @@ class PositionReviewer:
         self._client2 = None    # voter 2: different model, keys rotated by one
         self._last_review = {}   # ticket -> monotonic time of last review
         self._last_review_max = 256   # bounded: a 0.5s loop must not leak
+        # ticket -> journal row of its last proposal, so an ORPHANED verdict
+        # (position closed while the AI was thinking, marker already popped)
+        # can still be annotated as void instead of staying "proposed" forever.
+        self._last_decision = {}
         self._circuit_open_until = 0.0
         self._circuit_failures = 0
 
@@ -166,6 +170,19 @@ class PositionReviewer:
         """Position is gone (TP/SL/manual) — drop its cadence marker so the
         dict stays small and a recycled ticket number starts fresh."""
         self._last_review.pop(ticket, None)
+        self._last_decision.pop(int(ticket), None)
+
+    def annotate_ticket(self, ticket, *, execution, final_action,
+                        risk_result="not_reached"):
+        """Annotate the last proposal made about `ticket` (orphan verdicts)."""
+        try:
+            did = self._last_decision.get(int(ticket))
+        except (TypeError, ValueError):
+            did = None
+        if did:
+            self.annotate(did, execution=execution, final_action=final_action,
+                          risk_result=risk_result)
+            self._last_decision.pop(int(ticket), None)
 
     # ── availability (fail-SAFE: no verdict is just HOLD, never a halt) ──
     def _circuit_allow(self) -> bool:
@@ -461,6 +478,11 @@ class PositionReviewer:
             )
             res.decision_id = did
             if ticket is not None:
+                self._last_decision[int(ticket)] = did
+                if len(self._last_decision) > self._last_review_max:
+                    for t in sorted(self._last_decision)[:len(self._last_decision)
+                                    - self._last_review_max]:
+                        self._last_decision.pop(t, None)
                 # link the row to the ticket WITHOUT touching execution: the
                 # defaults of mark_execution() mean "executed", and this is
                 # still only a proposal until the loop says otherwise.
