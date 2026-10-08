@@ -42,6 +42,8 @@ from core                import risk_manager
 from core.ai_review      import AIReviewer
 from core.ai_position    import PositionReviewer
 from core.ai_regime      import RegimeReviewer
+from core.ai_bus         import AIBus
+from core                import ai_context
 from core.news           import NewsWatcher
 from core.ai_journal     import AIJournal
 from core.state_logger   import event, signal_log
@@ -84,6 +86,9 @@ def fresh_state():
         'consumed':        {},   # SR engine: {day_ordinal: set((level, dir))}
         'consumed_day':    -1,
         'ai_reject_cooldown_until': 0,  # pause re-reviews after a final AI reject
+        # ── v2.1 AI lanes (never block the loop, always re-checked on apply) ──
+        'pending_ai':   {},   # snapshot_key -> candidate waiting for a verdict
+        'position_ai':  {},   # ticket -> what the AI was shown, for the drift check
     }
 
 symbol_state = {sym: fresh_state() for sym in config.SYMBOLS}
@@ -100,47 +105,65 @@ risk_state           = risk_manager.RiskState()
 consec_losses        = 0
 entry_pause_until    = 0.0
 
-# AI entry reviewer (feature-flagged). When AI_ENABLED is False the reviewer
-# is a no-op: it makes no provider call and writes no journal, so the bot
-# behaves exactly as before. See config.AI_* and core/ai_review.py.
-ai_reviewer = None
-if getattr(config, 'AI_ENABLED', False) and getattr(config, 'AI_PROVIDER', 'disabled') != 'disabled':
-    ai_journal  = AIJournal(config.AI_JOURNAL_PATH)
-    ai_reviewer = AIReviewer(ai_journal)
-    logger.info(f"AI entry review ENABLED (provider={config.AI_PROVIDER}, "
-                f"model={config.AI_MODEL}, min_conf={config.AI_MIN_CONFIDENCE})")
-else:
-    logger.info("AI entry review disabled — signals flow straight to risk checks")
+# ═════════════════════════════════════════════════════════════
+#   AI roles — three independent reviewers, one transport lane
+#   (v2.1: each role is gated by config.ai_*_on(), i.e. its own flag PLUS
+#   working plumbing. In v2.0 the position manager required the ENTRY flag,
+#   so AI_POSITION_ENABLED=True was silently dead.)
+# ═════════════════════════════════════════════════════════════
+ai_bus                = None
+ai_journal            = None
+ai_reviewer           = None
+ai_position_reviewer  = None
+ai_regime             = None
 
-# AI position manager (reviews OPEN trades: HOLD / CLOSE / EXTEND).
-# Needs the same AI_ENABLED + AI_PROVIDER flags, plus AI_POSITION_ENABLED.
-ai_position_reviewer = None
-if (ai_reviewer is not None
-        and getattr(config, 'AI_POSITION_ENABLED', False)):
-    ai_position_reviewer = PositionReviewer(ai_journal)
-    logger.info(f"AI position manager ENABLED (every {config.AI_POSITION_INTERVAL:.0f}s "
-                f"per open trade | EXTEND at >= {config.AI_EXTEND_MIN_PROGRESS:.0%} to TP "
-                f"| min_conf {config.AI_POSITION_MIN_CONFIDENCE})")
-
-# News watcher — free RSS feed; major headlines go to Telegram, all recent
-# headlines feed the AI decision snapshots as untrusted data.
+# News watcher — free RSS feed; major headlines go to Telegram, and every
+# recent headline is handed to the AI snapshots as untrusted DATA (never as
+# instructions). The AI cannot query the internet; this is its only news feed.
 news_watcher = None
 if getattr(config, 'NEWS_ENABLED', False):
     news_watcher = NewsWatcher()
-    logger.info(f"News feed ENABLED ({config.NEWS_RSS_URL} every "
+    logger.info(f"News feed ON ({config.NEWS_RSS_URL} every "
                 f"{config.NEWS_POLL_SECONDS:.0f}s, keyword alerts)")
 
-# AI market adaptation — self-tunes whitelisted settings within hard
-# clamped ranges to match the market regime. Runtime-only; restart resets
-# to the .env baseline. Never touches loss limits, stops or sessions.
-ai_regime = None
-if (ai_reviewer is not None
-        and getattr(config, 'AI_REGIME_ENABLED', False)):
+if config.ai_entry_on():
+    ai_journal  = AIJournal(config.AI_JOURNAL_PATH)
+    ai_reviewer = AIReviewer(ai_journal)
+    logger.info(f"AI entry gate ON (provider={config.AI_PROVIDER}, "
+                f"model={config.AI_MODEL}, min_conf={config.AI_MIN_CONFIDENCE}, "
+                f"fail-closed)")
+if config.ai_position_on():
+    ai_journal = ai_journal or AIJournal(config.AI_JOURNAL_PATH)
+    ai_position_reviewer = PositionReviewer(ai_journal)
+    logger.info(f"AI position manager ON (every {config.AI_POSITION_INTERVAL:.0f}s "
+                f"per open trade | EXTEND at >= {config.AI_EXTEND_MIN_PROGRESS:.0%} "
+                f"to TP | {config.AI_POSITION_VOTES} votes | min_conf "
+                f"{config.AI_POSITION_MIN_CONFIDENCE} | fail-safe HOLD)")
+if config.ai_regime_on():
+    ai_journal = ai_journal or AIJournal(config.AI_JOURNAL_PATH)
     ai_regime = RegimeReviewer(ai_journal)
-    logger.info(f"AI market adaptation ENABLED (every {config.AI_REGIME_INTERVAL/3600:.1f}h | "
+    logger.info(f"AI directives ON (every {config.AI_REGIME_INTERVAL/3600:.1f}h, "
+                f"expire after {config.AI_REGIME_TTL_SECONDS/60:.0f}min | "
                 f"adjustable: {', '.join(config.AI_REGIME_ALLOWED)})")
-else:
-    logger.info("AI entry review disabled — signals flow straight to risk checks")
+elif getattr(config, 'AI_REGIME_ENABLED', False):
+    logger.warning("AI_REGIME_ENABLED=true but the plumbing is missing "
+                   "(AI_PROVIDER/AI_API_KEYS) — directives OFF")
+
+# The whole point of the bus: an 8s HTTP timeout in the provider must not
+# freeze break-even/trailing/reconciliation in a 0.5-1.0s loop.
+if ai_reviewer is not None or ai_position_reviewer is not None or ai_regime is not None:
+    if getattr(config, 'AI_ASYNC', True):
+        ai_bus = AIBus(workers=getattr(config, 'AI_WORKER_THREADS', 1),
+                       queue_max=getattr(config, 'AI_QUEUE_MAX', 12),
+                       result_ttl=getattr(config, 'AI_RESULT_TTL_SECONDS', 120.0))
+        ai_bus.start()
+    else:
+        logger.warning("AI_ASYNC=false — AI calls run inline and WILL stall the "
+                       "trading loop up to AI_TIMEOUT_SECONDS each")
+
+for _line in config.ai_status_lines():
+    logger.info(f"  AI/BOT FLOW | {_line}")
+
 
 def run_initial_training():
     force = getattr(config, 'FORCE_INITIAL_TRAINING', False)
@@ -176,7 +199,7 @@ def adopt_open_positions():
     import MetaTrader5 as mt5
     adopted_total = 0
     for symbol in config.SYMBOLS:
-        state = symbol_state[symbol]
+        state = state_for(symbol)
         known = {ps['ticket'] for ps in state['positions']}
         for p in (get_open_positions(symbol) or []):
             if p.ticket in known:
@@ -195,7 +218,7 @@ def adopt_open_positions():
     # positions so the pair stays managed across restarts.
     if getattr(config, 'ENTRY_ENGINE', 'SR_H1') == 'FLASH' and adopted_total:
         for symbol in config.SYMBOLS:
-            state = symbol_state[symbol]
+            state = state_for(symbol)
             if flash_engine.has_open_pair(state):
                 continue
             adopted = [ps for ps in state['positions'] if ps.get('adopted')]
@@ -221,23 +244,65 @@ def adopt_open_positions():
         logger.info(f"Re-adopted {adopted_total} open position(s) from previous run")
     return adopted_total
 
-def review_open_positions_ai(symbol, state):
-    """AI position manager: periodically review each open position and act on
-    an approved CLOSE (market close) or EXTEND (TP → 120% of original distance
-    + SL locked at AI_EXTEND_LOCK_PCT of floating profit). Everything else is
-    HOLD — the existing break-even/trailing rules keep managing the trade."""
+def state_for(symbol):
+    """Symbol state, created on demand. v2.0 indexed symbol_state[symbol]
+    directly, so any symbol not in config.SYMBOLS at import time raised
+    KeyError inside the trading path (and in the offline test suite)."""
+    st = symbol_state.get(symbol)
+    if st is None:
+        st = symbol_state.setdefault(symbol, fresh_state())
+    return st
+
+
+def _live_progress(symbol, p, direction):
+    """Signed progress toward TP — the SAME definition the AI is briefed on,
+    used both when building the snapshot and when re-checking it on arrival."""
+    tp_dist = abs(p.tp - p.price_open)
+    if tp_dist <= 0:
+        return None
+    moved = (p.price_current - p.price_open) if direction == 1 \
+        else (p.price_open - p.price_current)
+    return moved / tp_dist
+
+
+def submit_position_reviews(symbol, state):
+    """AI position manager, stage 1: snapshot + queue a review. NEVER blocks.
+
+    The verdict is applied in apply_position_verdicts() on a later loop, after
+    re-reading the position — so the AI answers about a trade that still exists
+    and still looks like what it was shown."""
     import MetaTrader5 as mt5
+    if ai_position_reviewer is None:
+        return
+    pending = state.setdefault('position_ai', {})
+    # Orphan guard: a marker whose verdict never arrived (worker died, result
+    # expired) must not freeze this ticket's reviews forever.
+    stale_after = float(getattr(config, 'AI_RESULT_TTL_SECONDS', 120.0)) * 2
+    now0 = time.time()
+    for t0, mark in list(pending.items()):
+        if now0 - mark.get('ts', 0) > stale_after:
+            pending.pop(t0, None)
     for ps in list(state['positions']):
         ticket = ps['ticket']
+        if ticket in pending:
+            continue                       # a verdict is already on its way
         p = get_position_by_ticket(ticket)
-        if p is None or not p.tp:
+        if p is None:
+            continue
+        if not p.tp:
+            # A position with no TP is the one thing the AI must not "fix" by
+            # closing on a whim — but it must never be invisible either.
+            signal_log.log(f"{symbol}:notp:{ticket}",
+                           f"● WARN {symbol} #{ticket} has no TP — AI position "
+                           f"review skipped (set TP manually or let TP/SL rule run)")
             continue
         tp_dist = abs(p.tp - p.price_open)
         if tp_dist <= 0:
             continue
         direction = 1 if p.type == mt5.ORDER_TYPE_BUY else -1
-        progress = ((p.price_current - p.price_open) if direction == 1
-                    else (p.price_open - p.price_current)) / tp_dist
+        progress = _live_progress(symbol, p, direction)
+        if progress is None:
+            continue
         if not ai_position_reviewer.due(ticket, progress):
             continue
 
@@ -261,116 +326,228 @@ def review_open_positions_ai(symbol, state):
             floating_usd=p.profit, progress=progress,
             minutes_open=max(0.0, (time.time() - p.time) / 60.0),
             atr=atr, rsi=rsi, spread_pct=spread_pct,
-            open_positions=sum(len(symbol_state[s]['positions'])
+            open_positions=sum(len(state_for(s)['positions'])
                                for s in config.SYMBOLS),
             max_positions=config.MAX_POSITIONS)
         if news_watcher is not None:
             ctx["recent_news"] = news_watcher.recent_titles(5)
         ctx["recent_performance"] = recent_performance()
-        res = ai_position_reviewer.review(ctx, ticket=ticket)
         ai_position_reviewer.mark_reviewed(ticket)
-        dir_str = "BUY" if direction == 1 else "SELL"
 
-        # One log line per review — always shows which models + keys voted
-        event(f"AI REVIEW {symbol} {dir_str} #{ticket} → {res.action} "
-              f"(conf {res.confidence:.2f} | {res.model} | {res.key_number}) "
-              f"— {res.reason_code}")
-
-        if res.action == "CLOSE" and res.approved:
-            ok, detail = close_position(symbol, ticket, "BOSS AI CLOSE")
-            if ok:
-                event(f"AI CLOSE {symbol} {dir_str} #{ticket} — "
-                      f"{res.reason_code} | banked {p.profit:+.2f} USD")
-                send(msg_ai_position(
-                    "CLOSE", symbol, dir_str, res.confidence,
-                    res.reason_code, res.reason, ticket,
-                    model=res.model, key=res.key_number,
-                    detail=f"💵 Banked ~<b>{p.profit:+.2f} USD</b>"))
-            else:
-                logger.error(f"AI CLOSE order failed for #{ticket}: {detail}")
-                try:
-                    ai_reviewer.journal.mark_execution(
-                        res.decision_id, ticket=ticket,
-                        execution="close_failed",
-                        final_action="ai_close_failed", risk_result="failed")
-                except Exception:
-                    pass
+        if ai_bus is None:                 # sync fallback (tests, AI_ASYNC=false)
+            try:
+                res = ai_position_reviewer.review(ctx, ticket=ticket)
+            except Exception as e:
+                logger.error(f"AI position review error ({type(e).__name__}): {e}")
+                continue
+            apply_position_action(symbol, ps, res, p, progress)
             continue
 
-        if res.action == "EXTEND" and res.approved and not ps.get('ai_extended'):
-            info = mt5.symbol_info(symbol)
-            digits = info.digits if info else 5
-            mult = float(getattr(config, 'AI_EXTEND_TP_MULT', 1.2))
-            lock = float(getattr(config, 'AI_EXTEND_LOCK_PCT', 0.7))
-            if direction == 1:
-                new_tp = round(p.price_open + tp_dist * mult, digits)
-                giveback = (1.0 - lock) * max(0.0, p.price_current - p.price_open)
-                new_sl = round(p.price_current - giveback, digits)
-                tp_ok = new_tp > p.tp
-                sl_ok = new_sl > p.sl and new_sl < p.price_current
-            else:
-                new_tp = round(p.price_open - tp_dist * mult, digits)
-                giveback = (1.0 - lock) * max(0.0, p.price_open - p.price_current)
-                new_sl = round(p.price_current + giveback, digits)
-                tp_ok = new_tp < p.tp
-                sl_ok = new_sl < p.sl and new_sl > p.price_current
-            if tp_ok and sl_ok and modify_position(ticket, new_sl, new_tp):
-                ps['ai_extended'] = True
-                event(f"AI EXTEND {symbol} {dir_str} #{ticket} — "
-                      f"TP {p.tp:.2f}→{new_tp:.2f}, SL locked {new_sl:.2f}")
-                send(msg_ai_position(
-                    "EXTEND", symbol, dir_str, res.confidence,
-                    res.reason_code, res.reason, ticket,
-                    model=res.model, key=res.key_number,
-                    detail=f"✅ TP → <code>{new_tp:.2f}</code>   ·   "
-                           f"🔒 SL locked → <code>{new_sl:.2f}</code>"))
-            else:
-                logger.warning(f"AI EXTEND not applied for #{ticket} "
-                               f"(tp_ok={tp_ok} sl_ok={sl_ok})")
+        pending[ticket] = {'ts': time.time(), 'progress': progress,
+                           'entry': p.price_open, 'tp': p.tp, 'sl': p.sl}
+        if not ai_bus.submit('position', str(ticket),
+                             lambda c=ctx, t=ticket:
+                             ai_position_reviewer.review(c, ticket=t)):
+            pending.pop(ticket, None)      # in flight / queue full — try later
 
 
-# ── AI performance briefing (the AI's "memory" of live results) ──
-# LLMs are stateless between calls, so we hand each decision a compact
-# summary of how recent REAL trades and past AI approvals turned out.
-_perf_cache = {'t': 0.0, 'data': None}
+def apply_position_action(symbol, ps, res, p, progress_at_review):
+    """AI position manager, stage 2: act on a verdict (main thread only).
+
+    CLOSE and EXTEND are the only two actions the AI owns, and each has to
+    survive a re-check: the trade may be gone, the price may have run away
+    from the snapshot the model judged, and the target may already be next."""
+    import MetaTrader5 as mt5
+    ticket = ps['ticket']
+    state = state_for(symbol)
+    dir_str = "BUY" if ps.get('direction', 1) == 1 else "SELL"
+    event(f"AI REVIEW {symbol} #{ticket} → {res.action} "
+          f"(conf {res.confidence:.2f} | {res.model} | {res.key_number}) "
+          f"— {res.reason_code}")
+    if res.action == "HOLD" or not res.approved:
+        return
+
+    def note(execution, final_action, risk_result="not_reached"):
+        """Tell the AI's memory what actually happened to its advice."""
+        if ai_position_reviewer is not None:
+            ai_position_reviewer.annotate(getattr(res, 'decision_id', 0),
+                                          execution=execution,
+                                          final_action=final_action,
+                                          risk_result=risk_result)
+
+    if p is None:
+        p = get_position_by_ticket(ticket)
+    if p is None:
+        event(f"AI {res.action} skipped {symbol} #{ticket} — position already "
+              f"gone (verdict was about a trade that no longer exists)")
+        note("not_applicable", "ai_" + res.action.lower() + "_skipped_gone")
+        return
+    direction = 1 if p.type == mt5.ORDER_TYPE_BUY else -1
+    progress_now = _live_progress(symbol, p, direction)
+    drift_limit = float(getattr(config, 'AI_POSITION_MAX_DRIFT_PROGRESS', 0.15))
+    if progress_now is None or abs(progress_now - progress_at_review) > drift_limit:
+        event(f"AI {res.action} DISCARDED {symbol} #{ticket} — price moved "
+              f"{(progress_now or 0) - progress_at_review:+.0%} of the way to TP "
+              f"since the snapshot (>{drift_limit:.0%}); fail-safe HOLD")
+        note("not_applicable", "ai_" + res.action.lower() + "_discarded_stale")
+        return
+
+    if res.action == "CLOSE":
+        ok, detail = close_position(symbol, ticket, "BOSS AI CLOSE")
+        if ok:
+            note("closed_by_ai", "ai_close_applied", "ai_actioned")
+            event(f"AI CLOSE {symbol} {dir_str} #{ticket} — "
+                  f"{res.reason_code} | banked {p.profit:+.2f} USD")
+            send(msg_ai_position(
+                "CLOSE", symbol, dir_str, res.confidence,
+                res.reason_code, res.reason, ticket,
+                model=res.model, key=res.key_number,
+                detail=f"💵 Banked ~<b>{p.profit:+.2f} USD</b>"))
+        else:
+            logger.error(f"AI CLOSE order failed for #{ticket}: {detail}")
+            # v2.1 fix: this used to reach into ai_reviewer.journal, which is
+            # None whenever the position manager runs without the entry gate.
+            note("close_failed", "ai_close_failed", "failed")
+        return
+
+    if res.action == "EXTEND" and ps.get('ai_extended'):
+        note("not_applicable", "ai_extend_already_done")
+        event(f"AI EXTEND refused {symbol} #{ticket} — this position was already "
+              f"extended once (one extension per position, by design)")
+    elif res.action == "EXTEND":
+        info = mt5.symbol_info(symbol)
+        digits = info.digits if info else 5
+        tp_dist = abs(p.tp - p.price_open)
+        mult = float(getattr(config, 'AI_EXTEND_TP_MULT', 1.15))
+        lock = float(getattr(config, 'AI_EXTEND_LOCK_PCT', 0.80))
+        if direction == 1:
+            new_tp = round(p.price_open + tp_dist * mult, digits)
+            giveback = (1.0 - lock) * max(0.0, p.price_current - p.price_open)
+            new_sl = round(p.price_current - giveback, digits)
+            tp_ok = new_tp > p.tp
+            sl_ok = new_sl > p.sl and new_sl < p.price_current
+        else:
+            new_tp = round(p.price_open - tp_dist * mult, digits)
+            giveback = (1.0 - lock) * max(0.0, p.price_open - p.price_current)
+            new_sl = round(p.price_current + giveback, digits)
+            tp_ok = new_tp < p.tp
+            sl_ok = new_sl < p.sl and new_sl > p.price_current
+        if tp_ok and sl_ok and modify_position(ticket, new_sl, new_tp):
+            # v2.1: write the new geometry BACK into the bot's own state.
+            # Without this the trade manager kept computing progress against
+            # the OLD tp and its "tighten TP at 80%" rule silently pulled the
+            # target back — the AI extension was undone one loop later.
+            ps['ai_extended'] = True
+            ps['tp'] = new_tp
+            ps['sl'] = new_sl
+            note("tp_extended", "ai_extend_applied", "ai_actioned")
+            ai_context.invalidate()
+            event(f"AI EXTEND {symbol} {dir_str} #{ticket} — "
+                  f"TP {p.tp:.2f}→{new_tp:.2f}, SL locked {new_sl:.2f}")
+            send(msg_ai_position(
+                "EXTEND", symbol, dir_str, res.confidence,
+                res.reason_code, res.reason, ticket,
+                model=res.model, key=res.key_number,
+                detail=f"✅ TP → <code>{new_tp:.2f}</code>   ·   "
+                       f"🔒 SL locked → <code>{new_sl:.2f}</code>"))
+        else:
+            note("extend_rejected", "ai_extend_rejected_bounds", "failed")
+            logger.warning(f"AI EXTEND not applied for #{ticket} "
+                           f"(tp_ok={tp_ok} sl_ok={sl_ok})")
 
 
+def apply_position_verdicts():
+    """Stage 2 for the async lane: match finished verdicts to their tickets."""
+    if ai_bus is None:
+        return
+    for full_key, ok, payload in ai_bus.collect('position'):
+        _, _, rest = full_key.partition(':')
+        try:
+            ticket = int(rest)
+        except (TypeError, ValueError):
+            continue
+        owner = None
+        for sym in list(symbol_state):
+            st = symbol_state[sym]
+            marked = st.get('position_ai', {}).pop(ticket, None)
+            if marked is not None:
+                ps = next((x for x in st['positions'] if x['ticket'] == ticket), None)
+                owner = (sym, ps, marked)
+                break
+        if owner is None:
+            continue                      # swept/expired marker — nothing to do
+        sym, ps, marked = owner
+        if ps is None:
+            continue                      # position closed while the AI thought
+        if not ok:
+            event(f"AI position review error for {sym} #{ticket} "
+                  f"({type(payload).__name__}) — fail-safe HOLD")
+            continue
+        p = get_position_by_ticket(ticket)
+        progress_now = None
+        if p is not None:
+            direction = 1 if p.type == 0 else -1
+            progress_now = _live_progress(sym, p, direction)
+        if progress_now is None:
+            progress_now = marked.get('progress', 0.0)
+        apply_position_action(sym, ps, payload, p, progress_now)
+
+
+
+# ── AI ⇄ bot briefing: the AI's memory of live results ──────────
+# LLMs are stateless between calls, so every decision gets a compact summary
+# of how recent REAL trades and the AI's own past verdicts turned out. v2.1:
+# the computation lives in core/ai_context.py so the entry gate, the position
+# manager and the directive review all see the SAME evidence (and the numbers
+# are labelled honestly — v2.0 called a 5-trade window "last_20_real_trades").
 def recent_performance():
-    """Compact live-performance briefing for AI decisions (60s cache)."""
-    now = time.time()
-    if _perf_cache['data'] is not None and now - _perf_cache['t'] < 60:
-        return _perf_cache['data']
-    import pandas as pd
-    data = {}
+    """Bot results + the AI's own track record, bounded and cached."""
+    out = {}
+    bot = ai_context.bot_results()
+    if bot:
+        out["recent_real_trades"] = {
+            "n": bot.get("trades", 0), "wins": bot.get("wins", 0),
+            "losses": bot.get("losses", 0),
+            "winrate_pct": bot.get("winrate_pct"),
+            "net_usd": bot.get("net_usd"),
+            "sequence": bot.get("sequence"),
+            "spread_pct_of_stop_avg": bot.get("spread_pct_of_stop_avg"),
+            "per_symbol": bot.get("per_symbol"),
+        }
+    me = ai_context.ai_track_record()
+    if me:
+        out["ai_history"] = me
     try:
         df = trade_logger.load()
-        # Only show last 5 trades to the AI — showing 20 trades worth of old
-        # losses makes the AI permanently refuse in "STALE_LOSS_STREAK" mode.
-        closed = df.dropna(subset=['outcome']).tail(5) \
-            if 'outcome' in df.columns else df.iloc[0:0]
-        wins = int((closed['outcome'] > 0).sum()) if len(closed) else 0
-        block = {'wins': wins, 'losses': int(len(closed) - wins)}
-        if len(closed):
-            block['winrate_pct'] = round(100 * wins / len(closed), 1)
-            profits = pd.to_numeric(closed.get('profit'), errors='coerce').dropna()
-            if len(profits):
-                block['avg_profit_usd'] = round(float(profits.mean()), 2)
-            block['sequence'] = ''.join('W' if o > 0 else 'L'
-                                        for o in closed['outcome'].tail(10))
-        data['last_20_real_trades'] = block
-    except Exception as e:
-        logger.error(f"perf briefing (trade log) failed: {type(e).__name__}")
-    try:
-        jdf = pd.read_csv(config.AI_JOURNAL_PATH)
-        app = jdf[(jdf['kind'] == 'entry') & (jdf['execution'] == 'executed')
-                  & (jdf['outcome'].notna())].tail(20)
-        w = int((app['outcome'] > 0).sum())
-        data['ai_approved_trades'] = {'wins': w, 'losses': int(len(app) - w)}
-    except Exception as e:
-        logger.error(f"perf briefing (AI journal) failed: {type(e).__name__}")
-    _perf_cache['t'] = now
-    _perf_cache['data'] = data
-    return data
+        stats = trade_logger.get_stats()
+        out["bot_stats"] = {"total": stats.get("total", 0),
+                            "winrate_pct": round(stats.get("winrate", 0.0), 1),
+                            "loss_streak": int(globals().get("consec_losses", 0))}
+    except Exception:
+        pass
+    if getattr(config, "ML_ENABLED", False):
+        try:
+            out["ml_gate"] = {"min_confidence": config.ML_MIN_CONFIDENCE,
+                              "trained": bool(ml_model.trained)}
+        except Exception:
+            pass
+    return out
+
+
+def ai_flow_summary():
+    """One line of truth about the AI layer — for the heartbeat and the log."""
+    parts = ["AI-entry:" + ("ON" if ai_reviewer is not None else "off"),
+             "AI-positions:" + ("ON" if ai_position_reviewer is not None else "off"),
+             "AI-directives:" + ("ON" if ai_regime is not None else "off")]
+    parts.append("queue=%d" % ai_bus.inflight() if ai_bus is not None
+                 else "mode=sync")
+    pend = sum(len(state_for(s).get('pending_ai') or {}) for s in config.SYMBOLS)
+    if pend:
+        parts.append("waiting_for_verdict=%d" % pend)
+    if ai_regime is not None and ai_regime.applied:
+        parts.append("directives=" + ",".join(
+            "%s=%s" % (k, v) for k, v in list(ai_regime.applied.items())[:4]))
+    return " | ".join(parts)
 
 
 def run_ai_regime_review():
@@ -390,21 +567,51 @@ def run_ai_regime_review():
         except Exception:
             continue
     acc = get_account_info()
-    regime, summary, applied = ai_regime.run(
-        symbols_stats, acc,
-        news_watcher.recent_titles(5) if news_watcher else [],
-        perf=recent_performance())
+    news = news_watcher.recent_titles(5) if news_watcher else []
+    perf = recent_performance()
+    ai_regime.mark_run()          # cadence starts now, not when the answer lands
+    if ai_bus is None:             # sync fallback (tests / AI_ASYNC=false)
+        report_regime(ai_regime.run(symbols_stats, acc, news, perf=perf))
+        return
+    if not ai_bus.submit('regime', 'review',
+                         lambda: ai_regime.evaluate(symbols_stats, acc, news,
+                                                     perf=perf)):
+        event("AI directive review skipped — queue busy; keeping current settings")
+
+
+def report_regime(res):
+    """Log + alert the outcome of one adaptation cycle (main thread)."""
+    regime, summary, applied = res
     event(f"AI REGIME → {regime} | {summary}")
     if applied:
         for p, old, new, why in applied:
             event(f"AI ADJUST {p}: {old} → {new} ({why})")
+        ai_context.invalidate()
         send(msg_regime(regime, summary, applied))
+
+
+def apply_regime_verdict():
+    """Stage 2 of the directive lane: the worker only ANSWERED; the config is
+    mutated here, on the main thread, through the same clamps."""
+    if ai_bus is None:
+        return
+    for _key, ok, payload in ai_bus.collect('regime'):
+        if not ok or payload is None:
+            event(f"AI directive review failed ({type(payload).__name__}) — "
+                  f"settings untouched")
+            continue
+        ctx, decision, model, provider, key_no = payload
+        if decision is None:
+            event(f"AI directive review skipped: {ai_regime.last_error() or 'no verdict'} "
+                  f"— settings untouched")
+            continue
+        report_regime(ai_regime.apply(decision, ctx, model, provider, key_no))
 
 
 def process_symbol_hf(symbol):
     """High-frequency processing for a single symbol"""
     global trades_since_retrain, last_retrain_time
-    state = symbol_state[symbol]
+    state = state_for(symbol)
     import MetaTrader5 as mt5
 
     # 1. Update Closed Trades & Outcome
@@ -435,13 +642,20 @@ def process_symbol_hf(symbol):
             continue
         profit = deal['profit']
         trade_logger.update_outcome(symbol, ticket, profit)
+        # ── THE RETURN PATH: bot → AI ──
         # Link the reconciled closed-trade result back to the AI decision(s)
-        # that approved this entry (from the bot's OWN deal only).
-        if ai_reviewer is not None:
+        # that touched this ticket, from the bot's OWN deal only (never a
+        # guess, never an open trade). v2.1 fix: this went through
+        # ai_reviewer.journal, so with only the position manager enabled the
+        # AI never learned how its own calls turned out — the loop was open.
+        jrn = ai_journal or getattr(ai_reviewer, 'journal', None)
+        if jrn is not None:
             try:
-                ai_reviewer.journal.link_outcome(symbol, ticket, profit)
+                jrn.link_outcome(symbol, ticket, profit)
             except Exception as e:
                 logger.error(f"AI journal link_outcome failed: {type(e).__name__}")
+        # the AI's memory must not show yesterday's numbers for 45s
+        ai_context.invalidate()
         trades_since_retrain += 1
         # Consecutive-loss circuit breaker — must write to the MODULE-LEVEL
         # globals (the old code used assignment inside a function which Python
@@ -464,6 +678,17 @@ def process_symbol_hf(symbol):
                 send(msg_error(f"🛑 Circuit breaker: {consec_losses} consecutive "
                                f"losses — all new entries paused {pause_min:.0f} min"))
                 consec_losses = 0  # recount after the pause
+        # Forget the AI bookkeeping for a dead ticket: its cadence marker and
+        # any verdict still in flight (applying a late CLOSE to a recycled
+        # ticket number would be worse than not applying it).
+        state.get('position_ai', {}).pop(ticket, None)
+        if ai_position_reviewer is not None:
+            try:
+                ai_position_reviewer.forget(ticket)
+            except Exception:
+                pass
+        if ai_bus is not None:
+            ai_bus.drop('position', str(ticket))
         stats = trade_logger.get_stats()
         event(f"CLOSE {symbol} #{ticket} → {'WIN' if profit>0 else 'LOSS'} "
               f"{profit:+.2f} | WR {stats['winrate']:.0f}% ({stats['wins']}W-{stats['losses']}L)")
@@ -513,20 +738,38 @@ def process_symbol_hf(symbol):
                 manage_open_trade(symbol, pos_state, state['feature_cache'], ml_model)
                 state['last_mod_time'] = time.time() # Update after mod attempt
 
-    # 4b. AI position manager — HOLD / CLOSE / EXTEND on open trades
-    # (own cadence; a failure here must never break the trading loop)
+    # 4b. AI position manager — queue a HOLD / CLOSE / EXTEND review for each
+    # open trade that is due. Submitting is cheap and NEVER blocks; the verdict
+    # is applied by apply_position_verdicts() once it lands.
     if ai_position_reviewer is not None and state['positions']:
         try:
-            review_open_positions_ai(symbol, state)
+            submit_position_reviews(symbol, state)
         except Exception as e:
             logger.error(f"AI position review error ({type(e).__name__}): {e}")
+
+    # 4c. AI entry candidates waiting for a verdict: drop the ones that will
+    # never get an answer (provider dead / queue dropped). Fail-closed.
+    try:
+        sweep_pending_entries(symbol, state)
+    except Exception as e:
+        logger.error(f"AI pending-entry sweep error ({type(e).__name__})")
 
     # 5. New Entry Scan — at most ONCE per new bar of the engine's TF
     #    (whether or not a trade is placed), so blocked entries don't cause a
     #    per-second scan/log storm.
+    #
+    #    v2.1: the session window, the loss circuit breaker and the AI-reject
+    #    cooldown are now checked for EVERY engine. In v2.0 they lived inside
+    #    the SMC_MTF branch only — so switching the engine silently switched
+    #    off the breaker that exists because of the FOMC whipsaw.
     scan_tf = "H1" if engine == "SR_H1" else "M1"
     cur_bar = _get_cur_bar(symbol, scan_tf)
     if cur_bar != state['last_scan_bar'] and len(state['positions']) < config.MAX_POSITIONS:
+        blocked_by = entry_gate_block_reason(symbol, state)
+        if blocked_by:
+            signal_log.log(f"{symbol}:gate",
+                           f"● SKIP {symbol} entry scan — {blocked_by}")
+            return
         state['last_scan_bar'] = cur_bar
         if engine == "SR_H1":
             # ENGINE C (duel winner): session+news filters live inside scan_sr
@@ -539,16 +782,18 @@ def process_symbol_hf(symbol):
                 event(f"SR SIGNAL {symbol} {decision['direction']} {decision['summary']}")
                 execute_trade(symbol, decision, cur_bar)
         elif engine == "FLASH":
-            # Original MTF high-freq flow (no session filter, no H1 gate) —
-            # one pair (main + optional hedge) at a time.
-            if _in_session() and not flash_engine.has_open_pair(state):
+            # Original MTF high-freq flow (no H1 gate) — one pair (main +
+            # optional hedge) at a time. Session/breaker already checked above.
+            if not flash_engine.has_open_pair(state):
                 decision = flash_engine.decide(symbol, get_candles, state)
                 if decision:
                     event(f"FLASH SIGNAL {symbol} {decision['direction']} "
                           f"TF {decision.get('chosen_tf', '?')} {decision['signal'].get('rsi', 0):.0f}")
                     execute_trade(symbol, decision, cur_bar)
         else:
-            if _in_session() and time.time() >= entry_pause_until:
+            # SMC_MTF (fast scalping). Session / circuit breaker / AI cooldown
+            # were already checked by the shared gate above.
+            if True:
                 decision = scan_all_timeframes(symbol, get_candles)
                 if decision:
                     # ATR explosion guard: block entries when current volatility
@@ -580,6 +825,28 @@ def process_symbol_hf(symbol):
                             signal_log.log(f"{symbol}:h1",
                                            f"● HOLD {symbol} {decision['direction']} — against H1 trend")
 
+def scan_tf_for(decision):
+    """The candle the entry scan is gated on — and therefore the bar a pending
+    AI verdict must be compared against. SR_H1 decides on H1, the fast engines
+    on M1; comparing an H1 bar against an M1 bar would call every verdict
+    stale and silently stop the bot from ever trading on an approval."""
+    return "H1" if (decision or {}).get('engine') == "SR_H1" else "M1"
+
+
+def entry_gate_block_reason(symbol, state):
+    """Deterministic 'may we look for a new entry at all?' — one answer for
+    every engine. Returns a short reason string, or None when open."""
+    if not _in_session():
+        return "outside trading session"
+    if time.time() < entry_pause_until:
+        return (f"loss circuit breaker active — "
+                f"{(entry_pause_until - time.time()) / 60.0:.0f} min left")
+    cd = float(state.get('ai_reject_cooldown_until', 0) or 0)
+    if time.time() < cd:
+        return f"AI reject cooldown ({(cd - time.time()):.0f}s left)"
+    return None
+
+
 def _refresh_consumed(state):
     """SR engine: keep per-day consumed-level sets, drop old days."""
     today = datetime.now(timezone.utc).date().toordinal()
@@ -598,8 +865,18 @@ def execute_trade(symbol, decision, cur_bar):
     risk checks / order path in _execute_trade_inner; REJECT / WAIT and any AI
     failure block it (fail-closed). The AI never places/cancels orders, sizes,
     or moves stops. When disabled this is a transparent pass-through.
+
+    v2.1 — the gate no longer blocks the loop:
+      • a verdict already cached for this exact snapshot is applied inline;
+      • otherwise the review is queued on the AI bus and this function returns
+        immediately. The candidate lives in state['pending_ai'] until
+        collect_entry_verdicts() applies it — and only if it is still fresh
+        (same bar, price inside AI_ENTRY_MAX_DRIFT_ATR, younger than
+        AI_ENTRY_MAX_AGE_SECONDS). No verdict = no trade, still fail-closed.
+      • with AI_ASYNC=false (or no bus, e.g. in tests) the review runs inline
+        exactly as before, so the documented synchronous contract holds too.
     """
-    state = symbol_state[symbol]
+    state = state_for(symbol)
     signal = decision['signal']
     atr = signal['atr']
     chosen_tf = decision.get('chosen_tf', 'M1')
@@ -636,21 +913,11 @@ def execute_trade(symbol, decision, cur_bar):
             except Exception:
                 pass
 
+    # ── the AI gate ──────────────────────────────────────────
     review = None
     if ai_reviewer is not None and getattr(ai_reviewer, 'enabled', False):
         try:
-            try:
-                spread_pct = get_spread_percent(symbol)
-            except Exception:
-                spread_pct = None
-            ctx = ai_reviewer.build_context(symbol, decision, signal, atr,
-                                            chosen_tf,
-                                            open_positions=len(state['positions']),
-                                            spread_pct=spread_pct)
-            if news_watcher is not None:
-                ctx["recent_news"] = news_watcher.recent_titles(5)
-            ctx["recent_performance"] = recent_performance()
-            review = ai_reviewer.review(ctx)
+            ctx = build_ai_snapshot(symbol, decision, state)
         except Exception as e:
             # Any unexpected AI-layer error fails CLOSED: block the candidate,
             # never approve, never crash the loop. Log type only (no raw body).
@@ -659,6 +926,81 @@ def execute_trade(symbol, decision, cur_bar):
             send(msg_error(f"AI review failed ({type(e).__name__}) — "
                            f"entry blocked (fail-closed)"))
             return
+
+        cached = ai_reviewer.peek_cached(ctx)
+        if cached is not None:
+            # the exact same snapshot was already judged — reuse, no second call
+            handle_entry_verdict(symbol, decision, cur_bar, cached, state)
+            return
+
+        if ai_bus is not None:
+            # ASYNC LANE: queue the review, keep the candidate, return at once.
+            # The loop keeps managing open trades; the order is placed (or not)
+            # when the verdict lands, after a freshness re-check. A candidate
+            # that never gets a verdict is never traded (fail-closed).
+            skey = ai_reviewer.snapshot_key(ctx)
+            if skey in state['pending_ai']:
+                return
+            try:
+                _ti = get_symbol_info(symbol)
+                _px = float(_ti.bid) if _ti else 0.0
+            except Exception:
+                _px = 0.0
+            state['pending_ai'][skey] = {
+                'decision': decision, 'cur_bar': cur_bar, 'ts': time.time(),
+                'price': _px, 'atr': float(signal.get('atr') or 0) or None,
+                'scan_tf': scan_tf_for(decision), 'symbol': symbol}
+            if not ai_bus.submit('entry', f"{symbol}|{skey}",
+                                 lambda c=ctx: ai_reviewer.review(c)):
+                state['pending_ai'].pop(skey, None)
+                event(f"AI queue full {symbol} {direction} — entry blocked "
+                      f"(fail-closed: no verdict = no trade)")
+                # back off for a moment rather than hammering a provider that
+                # is already behind (this is also what protects rate limits)
+                state['ai_reject_cooldown_until'] = time.time() + float(
+                    getattr(config, 'AI_QUEUE_BACKOFF_SECONDS', 10))
+            return
+
+        try:
+            review = ai_reviewer.review(ctx)     # sync fallback (AI_ASYNC=false)
+        except Exception as e:
+            logger.error(f"AI review error ({type(e).__name__}); "
+                         f"entry blocked (fail-closed)")
+            send(msg_error(f"AI review failed ({type(e).__name__}) — "
+                           f"entry blocked (fail-closed)"))
+            return
+
+    handle_entry_verdict(symbol, decision, cur_bar, review, state)
+
+
+def build_ai_snapshot(symbol, decision, state):
+    """One bounded, sanitized snapshot — shared by the sync and async lanes so
+    the model always sees the same shape of data (and the cache key matches)."""
+    signal = decision['signal']
+    try:
+        spread_pct = get_spread_percent(symbol)
+    except Exception:
+        spread_pct = None
+    ctx = ai_reviewer.build_context(
+        symbol, decision, signal, signal.get('atr'),
+        decision.get('chosen_tf', 'M1'),
+        open_positions=len(state['positions']),
+        spread_pct=spread_pct)
+    if news_watcher is not None:
+        ctx["recent_news"] = news_watcher.recent_titles(5)
+    ctx["recent_performance"] = recent_performance()
+    return ctx
+
+
+def handle_entry_verdict(symbol, decision, cur_bar, review, state):
+    """One verdict → either the UNCHANGED deterministic path, or a block.
+
+    Alerting, the reject cooldown and journal finalisation live here, so the
+    inline (cache / sync) and asynchronous (bus) lanes behave identically —
+    the AI has exactly one voice, whichever way it arrived."""
+    direction = decision['direction']
+    block_reason = {'v': None}
+    if review is not None:
         # Telegram: surface every AI decision (APPROVE / REJECT / WAIT /
         # blocked) so the owner sees the AI gate working in real time.
         send(msg_ai_decision(review.action, symbol, direction,
@@ -671,30 +1013,106 @@ def execute_trade(symbol, decision, cur_bar):
             event(f"AI {review.action} {symbol} {direction} — {review.reason_code} "
                   f"(conf {review.confidence:.2f} | {review.model} | key#"
                   f"{review.key_number}){appeal}; entry blocked")
-            # Cooldown: same setup re-fires every M5 bar — skip re-review for 1 bar only.
-            # Was 300s (5 min) which silently killed all signals for 5 min per reject.
-            state['ai_reject_cooldown_until'] = time.time() + 60
+            # Cooldown is ONE bar of the engine's timeframe, not five minutes:
+            # v2.0's 300s silently killed every fresh signal after a reject.
+            state['ai_reject_cooldown_until'] = time.time() + float(
+                getattr(config, 'AI_REJECT_COOLDOWN_SECONDS', 45))
+            # Nothing more to journal: the reviewer already wrote the row with
+            # execution=not_executed / final_action=ai_<action>. And no order:
+            # a veto is final, the deterministic path is never reached.
             return
         event(f"AI APPROVE {symbol} {direction} — {review.reason_code} "
               f"(conf {review.confidence:.2f} | {review.model} | key#"
               f"{review.key_number}){appeal} → risk checks")
 
-    block_reason = {'v': None}
     try:
         _execute_trade_inner(symbol, decision, cur_bar, review, block_reason)
     finally:
         # If the AI approved but the candidate never reached an order, record
         # the deterministic outcome. A no-op if the candidate already executed.
-        if review is not None:
+        _finalize_ai(block_reason['v'],
+                     review.decision_id if review is not None else None)
+
+
+def _finalize_ai(block_reason, decision_id):
+    """Journal the deterministic fate of an AI-approved candidate. Never raises
+    — a bookkeeping error must not cost a trade or crash the loop."""
+    if ai_reviewer is None or not decision_id:
+        return
+    try:
+        ai_reviewer.journal.finalize_pending(decision_id, block_reason=block_reason)
+    except Exception as e:
+        logger.error(f"AI journal finalize failed: {type(e).__name__}")
+
+
+def sweep_pending_entries(symbol, state):
+    """Drop candidates whose verdict never arrived (queue drop, provider dead,
+    result expired). No verdict = no trade — and the journal says why."""
+    if not state.get('pending_ai'):
+        return
+    max_age = float(getattr(config, 'AI_ENTRY_MAX_AGE_SECONDS', 45))
+    for skey, cand in list(state['pending_ai'].items()):
+        if time.time() - cand['ts'] <= max_age:
+            continue
+        state['pending_ai'].pop(skey, None)
+        event(f"AI verdict TIMEOUT {symbol} {cand['decision']['direction']} — no "
+              f"answer in {max_age:.0f}s; entry dropped (fail-closed)")
+        signal_log.log(f"{symbol}:aitimeout",
+                       f"● {symbol} AI entry verdict timed out — no trade")
+
+
+def collect_entry_verdicts():
+    """Stage 2 of the entry gate. A verdict is applied only if the trade it
+    described is still the trade on offer: same bar, price inside the drift
+    budget, positions under the cap. Otherwise it is dropped as STALE — an
+    AI answer about the past is not a licence for the present."""
+    if ai_bus is None:
+        return
+    max_age = float(getattr(config, 'AI_ENTRY_MAX_AGE_SECONDS', 45))
+    max_drift = float(getattr(config, 'AI_ENTRY_MAX_DRIFT_ATR', 0.5))
+    for full_key, ok, payload in ai_bus.collect('entry'):
+        _, _, rest = full_key.partition(':')
+        sym, _, skey = rest.partition('|')
+        state = state_for(sym)
+        cand = state.get('pending_ai', {}).pop(skey, None)
+        if cand is None:
+            continue                      # already swept — do not act on ghosts
+        if not ok:
+            logger.error(f"AI entry review raised ({type(payload).__name__}) for "
+                         f"{sym} — entry blocked (fail-closed)")
+            send(msg_error(f"AI review raised ({type(payload).__name__}) — "
+                           f"entry blocked (fail-closed)"))
+            continue
+        age = time.time() - cand['ts']
+        if age > max_age:
+            event(f"AI verdict STALE {sym} — {age:.0f}s old (>{max_age:.0f}s); "
+                  f"entry dropped")
+            _finalize_ai('ai_verdict_stale', getattr(payload, 'decision_id', 0))
+            continue
+        if _get_cur_bar(sym, cand.get('scan_tf', 'M1')) != cand['cur_bar']:
+            event(f"AI verdict STALE {sym} — the signal bar rolled over while the "
+                  f"AI thought; entry dropped (a new scan re-arms)")
+            _finalize_ai('ai_verdict_stale_bar', getattr(payload, 'decision_id', 0))
+            continue
+        if max_drift > 0 and cand.get('atr'):
             try:
-                ai_reviewer.journal.finalize_pending(
-                    review.decision_id, block_reason=block_reason['v'])
-            except Exception as e:
-                logger.error(f"AI journal finalize failed: {type(e).__name__}")
+                ti = get_symbol_info(sym)
+                px = float(ti.bid) if ti else 0.0
+            except Exception:
+                px = 0.0
+            if px and cand['price']:
+                drift = abs(px - cand['price']) / cand['atr']
+                if drift > max_drift:
+                    event(f"AI verdict STALE {sym} — price moved {drift:.2f} ATR "
+                          f"since the snapshot (>{max_drift}); entry dropped")
+                    _finalize_ai('ai_verdict_stale_drift',
+                                 getattr(payload, 'decision_id', 0))
+                    continue
+        handle_entry_verdict(sym, cand['decision'], cand['cur_bar'], payload, state)
 
 
 def _execute_trade_inner(symbol, decision, cur_bar, review, block_reason):
-    state = symbol_state[symbol]
+    state = state_for(symbol)
     import MetaTrader5 as mt5
 
     direction = decision['direction']
@@ -755,6 +1173,41 @@ def _execute_trade_inner(symbol, decision, cur_bar, review, block_reason):
         event(f"SKIP {symbol} {direction} — spread {spread_pct:.3f}% above "
               f"max {config.MAX_SPREAD}%")
         return
+
+    # ── Cost gate: spread as a share of the stop distance (v2.1) ──
+    # % of PRICE is a blunt tool: 0.05% of a $4,000 gold price is $2 of spread,
+    # which is nothing on an H1 swing trade and fatal on an M5 scalp with a $4
+    # stop. This measures the number that actually decides whether a scalp can
+    # pay — and the AI snapshot carries the SAME value, so the deterministic bot
+    # and the reviewer argue from one measurement instead of two.
+    cost_cap = float(getattr(config, 'MAX_SPREAD_COST_PCT', 0) or 0)
+    if cost_cap > 0:
+        _atr_now = float(signal.get('atr') or 0)
+        _t = mt5.symbol_info_tick(symbol)
+        _px0 = 0.0
+        if _t is not None:
+            try:
+                _px0 = float(_t.ask if direction == 'BUY' else _t.bid)
+            except (TypeError, ValueError):
+                _px0 = 0.0
+        if decision.get('sl_price') is not None and _px0 > 0:
+            _stop_dist = abs(_px0 - float(decision['sl_price']))
+        elif decision.get('sl_mult') is not None and _atr_now > 0:
+            _stop_dist = abs(float(decision['sl_mult'])) * _atr_now
+        else:
+            _stop_dist = 0.0
+        _cost = ai_context.spread_cost_pct(spread_pct, _stop_dist, _px0)
+        if _cost is not None and _cost > cost_cap:
+            # change-only logging: a wide-spread market would otherwise shout
+            # once per bar per symbol
+            signal_log.log(f"{symbol}:cost",
+                           f"● SKIP {symbol} {direction} — spread is {_cost:.0f}% "
+                           f"of the stop distance (cap {cost_cap:.0f}%): the cost "
+                           f"is the trade, no entry")
+            if review is not None:
+                block_reason['v'] = f"spread_cost:{_cost:.0f}pct"
+            return
+        decision['spread_cost_pct'] = _cost      # visible to the AI + the log
 
     # ── ML filter + pattern-match alerts (single source of truth) ──
     # The SR_H1 engine is validated WITHOUT the ML gate (duel parity) — the
@@ -906,8 +1359,15 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v1.9.4  —  High-Freq Loop")
+    logger.info(f"  BOSS SMC BOT  v2.1  —  AI ⇄ Bot flow  [{config.BOT_PROFILE}]")
     logger.info("=" * 57)
+    logger.info(f"  engine={config.ENTRY_ENGINE} symbols={len(config.SYMBOLS)} "
+                f"loop={config.ANALYSIS_INTERVAL_SECONDS}s "
+                f"risk={config.RISK_PERCENT_PER_TRADE}%/trade "
+                f"session={config.SESSION_START}-{config.SESSION_END}UTC "
+                f"filter={config.SESSION_FILTER}")
+    for _l in config.ai_status_lines():
+        logger.info(f"  FLOW | {_l}")
 
     if not connect():
         logger.error("MT5 connection failed.")
@@ -941,12 +1401,15 @@ def main():
                     sym = config.SYMBOLS[0]
                     tick_info = get_symbol_info(sym)
                     price = f"{tick_info.bid:.2f}" if tick_info else "n/a"
-                    n_pos = sum(len(symbol_state[s]['positions'])
+                    n_pos = sum(len(state_for(s)['positions'])
                                 for s in config.SYMBOLS)
+                    # v2.1: the heartbeat states what is REALLY running. v2.0
+                    # printed "AI gate ON" with the entire AI layer switched off.
                     logger.info(
                         f"♥ ALIVE | {sym} {price} | equity ${acc.equity:.2f} | "
                         f"floating ${acc.profit:+.2f} | open positions: {n_pos} "
-                        f"| AI gate ON | scanning 24/7")
+                        f"| {ai_flow_summary()} | engine {config.ENTRY_ENGINE} "
+                        f"| profile {config.BOT_PROFILE}")
                 except Exception:
                     logger.info("♥ ALIVE | scanning 24/7")
 
@@ -959,10 +1422,23 @@ def main():
                 except Exception as e:
                     logger.error(f"News refresh error ({type(e).__name__})")
 
-            # AI market adaptation: periodic bounded self-tuning
-            if ai_regime is not None and ai_regime.due():
+            # ── AI ⇄ bot lane: apply finished verdicts (never blocks) ──
+            if ai_bus is not None:
                 try:
-                    run_ai_regime_review()
+                    collect_entry_verdicts()
+                    apply_position_verdicts()
+                    apply_regime_verdict()
+                except Exception as e:
+                    logger.error(f"AI verdict collection error ({type(e).__name__})")
+
+            # AI directives: an expired directive is debris, not a decision —
+            # restore the owner's baseline first, then adapt if it is due.
+            if ai_regime is not None:
+                try:
+                    for param, _old, base in ai_regime.expire_if_stale():
+                        event(f"AI DIRECTIVE EXPIRED {param} → baseline {base}")
+                    if ai_regime.due():
+                        run_ai_regime_review()
                 except Exception as e:
                     logger.error(f"AI regime error ({type(e).__name__})")
                     ai_regime.mark_run()  # never hammer on repeated failures

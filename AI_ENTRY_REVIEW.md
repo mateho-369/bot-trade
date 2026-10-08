@@ -11,8 +11,10 @@ when off, the bot behaves exactly as before (no provider call, no journal).
 strategy (scan_sr / flash_engine.decide / scan_all_timeframes)
         │  candidate `decision`
         ▼
-main.execute_trade()            ◀── AI gate runs HERE (fail-closed)
-        │  APPROVE (conf ≥ AI_MIN_CONFIDENCE)
+main.execute_trade()            ◀── AI gate requested HERE, on a worker thread
+        │  AIBus.submit(entry) → the 0.5s loop never waits on HTTP
+        │  verdict returns later → freshness re-check (same bar, ≤0.5 ATR,
+        │  ≤45s) → APPROVE (conf ≥ AI_MIN_CONFIDENCE)
         ▼
 _execute_trade_inner()          ── unchanged deterministic path ──
    ENABLE_BUY/SELL → cooldown → volatility guard → position cap →
@@ -51,7 +53,11 @@ loss limit / drawdown limit, or overrides a deterministic veto.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AI_ENABLED` | `false` | Master switch. `false` ⇒ identical behavior, no call. |
+| `AI_ENABLED` | `false` | Entry gate (role 1). `false` ⇒ identical behavior, no call. |
+| `AI_POSITION_ENABLED` / `AI_REGIME_ENABLED` | `true` | Roles 2/3 — **independent of `AI_ENABLED` since v2.1** (in v2.0 they silently required it). |
+| `AI_ASYNC` / `AI_WORKER_THREADS` / `AI_QUEUE_MAX` | `true` / `1` / `12` | AI runs off the hot loop; a full queue drops work AND backs the scan off. |
+| `AI_ENTRY_MAX_AGE_SECONDS` / `AI_ENTRY_MAX_DRIFT_ATR` | `45` / `0.5` | A verdict may only fire on the bar the AI actually saw. |
+| `AI_REJECT_COOLDOWN_SECONDS` | `45` | After a REJECT, stop re-asking every bar (v2.0 hardcoded 300s). |
 | `AI_PROVIDER` | `disabled` | `openai_compat` (OpenAI/Groq/Together/local `/v1`) or `disabled`. |
 | `AI_BASE_URL` / `AI_API_KEY` / `AI_MODEL` | OpenAI / empty / `gpt-4o-mini` | Endpoint + key (env only) + model. |
 | `AI_RESPONSE_FORMAT` | `json_object` | `json_schema` for providers with strict structured output. |
@@ -60,7 +66,16 @@ loss limit / drawdown limit, or overrides a deterministic veto.
 | `AI_CIRCUIT_FAILURES` / `AI_CIRCUIT_COOLDOWN_SECONDS` | `5` / `120` | Open the circuit after N consecutive availability failures. |
 | `AI_MIN_CONFIDENCE` | `0.60` | An `APPROVE` below this is treated as `WAIT`. |
 | `AI_JOURNAL_PATH` | `SMC_Bot_Data/data/ai_decisions.csv` | Additive decision journal. |
-| `AI_SCHEMA_VERSION` / `AI_FEATURE_VERSION` | `entry_review_v1` / `sr_h1_v1` | Stamped into prompts + journal. |
+| `AI_SCHEMA_VERSION` / `AI_FEATURE_VERSION` | `entry_review_v2` / `sr_h1_v2` | Stamped into prompts + journal. |
+| `MAX_SPREAD_COST_PCT` | `18.0` | Cost gate: refuse a trade whose spread is >18% of the stop (the reason M1 gold lost — see `REAL_WORLD_TEST.md`). |
+
+**v2.1 changes the direction of this doc's promise — in both ways.** The AI no
+longer only vetoes: it receives the bot's *real* management contract (the actual
+BE/trailing/tighten numbers, not a description), the live news blackout, and
+`ai_lessons()` / `bot_results()` — its own past proposals next to what actually
+happened, read back from the journal it used to only write to. Positions get a
+bounded advisory channel back (`EXTEND` now survives Rule 4). Full flow, the
+17 fixed defects and the diagrams: **`docs/FLOW_AI_BOT.md`**.
 
 ## Enable / disable safely
 

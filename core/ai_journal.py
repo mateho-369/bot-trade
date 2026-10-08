@@ -58,8 +58,12 @@ def _sanitize_summary(summary: dict) -> str:
 
 
 class AIJournal:
-    def __init__(self, path: str):
+    def __init__(self, path: str, max_rows: int = None):
         self.path = path
+        self.max_rows = int(max_rows if max_rows is not None
+                            else getattr(__import__("config"), "AI_JOURNAL_MAX_ROWS",
+                                         20000))
+        self._next_id_cache = None
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if not os.path.exists(path):
             pd.DataFrame(columns=_COLUMNS).to_csv(path, index=False)
@@ -116,16 +120,31 @@ class AIJournal:
         return decision_id
 
     def _next_id(self) -> int:
-        try:
-            df = pd.read_csv(self.path, usecols=["decision_id"])
-            if len(df) and df["decision_id"].notna().any():
-                return int(df["decision_id"].max()) + 1
-        except Exception:
-            pass
-        return 1
+        # In-memory counter, seeded from the file once. v2.0 re-read the whole
+        # CSV for every single row — with a 20k-row journal that is a growing
+        # cost inside a sub-second loop for zero benefit.
+        if self._next_id_cache is None:
+            self._next_id_cache = 1
+            try:
+                df = pd.read_csv(self.path, usecols=["decision_id"])
+                if len(df) and df["decision_id"].notna().any():
+                    self._next_id_cache = int(df["decision_id"].max()) + 1
+            except Exception:
+                pass
+        nid = self._next_id_cache
+        self._next_id_cache = nid + 1
+        return nid
 
-    def mark_execution(self, decision_id: int, *, ticket, risk_result="passed",
-                       execution="executed", final_action="executed"):
+    def mark_execution(self, decision_id: int, *, ticket=None,
+                       risk_result="passed", execution="executed",
+                       final_action="executed"):
+        """Record what the loop did with a decision.
+
+        `ticket` is optional: annotating the OUTCOME (executed / close_failed /
+        discarded_stale) does not always have a ticket to name. It used to be a
+        required keyword, so every outcome annotation raised TypeError and was
+        swallowed by the callers' broad except — the journal silently kept the
+        provisional value and the AI's memory never saw what really happened."""
         self._update(decision_id, ticket=ticket, risk_result=risk_result,
                      execution=execution, final_action=final_action)
 
@@ -148,12 +167,13 @@ class AIJournal:
             return 0
         mask = ((df["symbol"] == symbol) & (df["ticket"] == ticket)
                 & (df["outcome"].isna()) & (df["ticket"].notna()))
-        if mask.sum() == 0:
+        n = int(mask.sum())
+        if n == 0:
             return 0
         df.loc[mask, "outcome"] = 1 if profit > 0 else 0
         df.loc[mask, "profit"] = float(profit)
         df.to_csv(self.path, index=False)
-        return int(mask.sum())
+        return n
 
     # ── internal ─────────────────────────────────────────────
     def _update(self, decision_id, *, ticket=None, risk_result=None,
@@ -176,6 +196,10 @@ class AIJournal:
             df.loc[mask, "execution"] = execution
         if final_action is not None:
             df.loc[mask, "final_action"] = final_action
+        # The journal must not grow forever: a scalping bot writes a row per
+        # AI consultation, so keep the tail (the part the feedback loop reads).
+        if self.max_rows and len(df) > self.max_rows:
+            df = df.iloc[-self.max_rows:]
         df.to_csv(self.path, index=False)
 
 
