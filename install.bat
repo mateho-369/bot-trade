@@ -12,6 +12,8 @@ IF %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Python not found!
     echo Download from: https://www.python.org/downloads/
     echo Make sure to check "Add Python to PATH" during install.
+    echo Use Python 3.10 - 3.12 (64-bit): MetaTrader5 and numpy wheels for
+    echo newer versions may not exist, which breaks this install step.
     pause
     exit /b 1
 )
@@ -78,7 +80,10 @@ echo   Done! Installation complete.
 echo ============================================
 echo.
 echo Next steps:
-echo   1. Edit .env with your MT5 + Telegram details (if not done).
-echo   2. Start the bot with:  run_bot_forever.bat   (auto-restarts on crash)
+echo   1. Edit .env with your MT5 (and Telegram / AI key) details.
+echo   2. Check you are ready:   venv\Scripts\python.exe preflight.py
+echo   3. Start the bot with:    run_bot_forever.bat   (auto-restarts on crash)
+echo      Open the MetaTrader 5 terminal first and enable
+echo      Tools - Options - Expert Advisors - Allow algorithmic trading.
 echo.
 pause

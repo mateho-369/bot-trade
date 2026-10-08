@@ -15,7 +15,7 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import config
 from tg_alerts.alerts import msg_adjusted, send
-from core.state_logger import trade_log as _change_log, event
+from core.state_logger import trade_log as _change_log, event, signal_log
 
 logger = logging.getLogger("TradeManager")
 
@@ -181,7 +181,13 @@ def manage_open_trade(symbol, state, df_feat, ml_model):
             logger.debug(f"[{symbol}] Near SL but ML not confident — keeping SL tight")
 
     # ── RULE 4: TIGHTEN TP IF TREND WEAKENS ─────────────────
-    if progress_pct >= 0.80:
+    # v2.1 flow fix: if the AI position manager EXTENDED this trade's target
+    # (and locked profit into the SL), pulling the TP back to 90% of the
+    # ORIGINAL distance silently cancels that decision one loop later. The
+    # extension is a deliberate "let the runner run" call, made with 2 votes
+    # and a confidence floor — so this rule stands down for it. (Trailing and
+    # break-even keep running: they are the protection, not the target.)
+    if progress_pct >= 0.80 and not state.get('ai_extended'):
         ml_confident = _check_ml_confidence(last, state, ml_model)
 
         if not ml_confident and progress_pct < 1.0:
@@ -210,23 +216,32 @@ def manage_open_trade(symbol, state, df_feat, ml_model):
         final_sl = new_sl if new_sl is not None else pos.sl
         final_tp = new_tp if new_tp is not None else pos.tp
 
-        # Validate before sending
-        min_stop = info.trade_stops_level * info.point if info else 0
-
+        # Validate before sending. v2.1: these are change-only now. A price
+        # that has already run past the TP makes the candidate invalid on EVERY
+        # loop (0.5s) until the broker fills it — as a logger.warning that is
+        # hundreds of identical lines a minute (seen in the loop smoke test).
         valid = True
         if direction == 1:
             if final_sl >= current_price:
-                logger.warning(f"[{symbol}] Invalid SL {final_sl} >= price {current_price}")
+                signal_log.log(f"{symbol}:{ticket}:sl",
+                               f"[{symbol}] #{ticket} SL {final_sl} would sit at/above "
+                               f"price {current_price} — change skipped")
                 valid = False
             if final_tp <= current_price:
-                logger.warning(f"[{symbol}] Invalid TP {final_tp} <= price {current_price}")
+                signal_log.log(f"{symbol}:{ticket}:tp",
+                               f"[{symbol}] #{ticket} TP {final_tp} already behind price "
+                               f"{current_price} — change skipped")
                 valid = False
         else:
             if final_sl <= current_price:
-                logger.warning(f"[{symbol}] Invalid SL {final_sl} <= price {current_price}")
+                signal_log.log(f"{symbol}:{ticket}:sl",
+                               f"[{symbol}] #{ticket} SL {final_sl} would sit at/below "
+                               f"price {current_price} — change skipped")
                 valid = False
             if final_tp >= current_price:
-                logger.warning(f"[{symbol}] Invalid TP {final_tp} >= price {current_price}")
+                signal_log.log(f"{symbol}:{ticket}:tp",
+                               f"[{symbol}] #{ticket} TP {final_tp} already ahead of price "
+                               f"{current_price} — change skipped")
                 valid = False
 
         if valid:
@@ -243,7 +258,12 @@ def manage_open_trade(symbol, state, df_feat, ml_model):
                 # Send Telegram Alert
                 send(msg_adjusted(symbol, ticket, old_sl, final_sl, old_tp, final_tp, reason))
             else:
-                logger.warning(f"[{symbol}] Position {ticket} modify failed")
+                # the broker can refuse a modify repeatedly (stops too close);
+                # say it once per state change, not once per loop
+                signal_log.log(f"{symbol}:{ticket}:modfail",
+                               f"[{symbol}] #{ticket} modify REJECTED by broker — "
+                               f"SL/TP unchanged, trade still protected by the "
+                               f"stops on file")
 
 
 def _get_position_by_ticket(ticket):
