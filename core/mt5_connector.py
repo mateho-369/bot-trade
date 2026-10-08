@@ -131,6 +131,11 @@ def get_spread_percent(symbol):
 def get_account_info():
     return mt5.account_info()
 
+# NOTE: close_position / modify_position are defined ONCE, near the end of
+# this file (after get_closed_trades). Earlier duplicates were removed —
+# Python silently keeps only the LAST definition, which caused a
+# signature mismatch (AI CLOSE calls failed with TypeError).
+
 # ── ORDER EXECUTION ──────────────────────────────────────────
 
 def place_buy(symbol, lot, sl, tp, comment="BOSS BUY"):
@@ -335,15 +340,15 @@ def modify_position(ticket, new_sl, new_tp):
     return True
 
 
-def close_position(symbol, ticket):
-    """Close an open position at market (opposite side, same volume, no SL/TP).
-    Returns the exit price, or None on failure."""
+def close_position(symbol, ticket, comment="BOSS CLOSE"):
+    """Close an open position at market (opposite side, same volume).
+    Returns (ok, detail)."""
     pos = get_position_by_ticket(ticket)
     if pos is None:
-        return None
+        return False, "position not found"
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        return None
+        return False, "no tick"
     if pos.type == mt5.ORDER_TYPE_BUY:
         otype, price = mt5.ORDER_TYPE_SELL, tick.bid
     else:
@@ -358,19 +363,17 @@ def close_position(symbol, ticket):
         "tp":           0.0,
         "deviation":    50,
         "magic":        505001,
-        "comment":      "FLASH CLOSE",
+        "comment":      comment,
         "position":     int(ticket),
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
     result = mt5.order_send(request)
     if result is None:
-        logger.warning(f"Close {ticket}: {mt5.last_error()}")
-        return None
+        return False, str(mt5.last_error())
     ok_codes = (mt5.TRADE_RETCODE_DONE,
                 getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))
     if result.retcode not in ok_codes:
-        logger.warning(f"Close {ticket}: retcode {result.retcode} {result.comment}")
-        return None
-    logger.info(f"[{symbol}] Closed #{ticket} @ {price:.2f} ({pos.volume} lots)")
-    return price
+        return False, f"retcode {result.retcode} {result.comment}"
+    logger.info(f"[{symbol}] Closed #{ticket} @ {price:.2f} ({comment})")
+    return True, "OK"

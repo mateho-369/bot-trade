@@ -117,7 +117,9 @@ AI_ACTIONS = ("APPROVE", "REJECT", "WAIT")
 # Optional bounded risk flags the model may raise (data, never instructions).
 AI_RISK_FLAGS = (
     "HIGH_SPREAD", "NEWS_WINDOW", "LOW_LIQUIDITY", "HIGH_VOLATILITY",
-    "COUNTER_TREND", "THIN_STOP", "WIDE_STOP", "OTHER",
+    "COUNTER_TREND", "THIN_STOP", "WIDE_STOP",
+    "CHOP_ZONE", "WEAK_PATTERN", "RESISTANCE_OVERHEAD",
+    "SUPPORT_OVERHEAD", "EXHAUSTION_CANDLE", "OTHER",
 )
 
 # OpenAI/Groq strict json_schema form (all properties required, no extras).
@@ -210,7 +212,15 @@ class OpenAICompatClient:
     def __init__(self, *, base_url, api_key, model, timeout_seconds,
                  max_output_tokens, response_format="json_object"):
         self.base_url = (base_url or "").rstrip("/")
-        self._api_key = api_key or ""
+        # api_key may be a single key or a list — rotate on rate limits,
+        # permanently skip keys rejected with 401/403.
+        if isinstance(api_key, (list, tuple)):
+            self._keys = [str(k).strip() for k in api_key if str(k).strip()]
+        else:
+            self._keys = [api_key] if api_key else []
+        self._key_idx = 0
+        self.last_key_number = 0   # 1-based index of the key that served the
+                                   # most recent successful call (for logs)
         self.model = model
         self.timeout = float(timeout_seconds)
         self.max_output_tokens = int(max_output_tokens)
@@ -219,7 +229,7 @@ class OpenAICompatClient:
 
     @property
     def configured(self) -> bool:
-        return bool(self._api_key) and bool(self.base_url)
+        return bool(self._keys) and bool(self.base_url)
 
     def _response_format(self, schema):
         if self.response_format == "json_schema":
@@ -229,8 +239,14 @@ class OpenAICompatClient:
         return {"type": "json_object"}
 
     def complete(self, messages, schema):
+        """One bounded completion. Tries each configured key at most once per
+        call (keys rotate on 429/5xx/timeout; 401/403 keys are skipped for
+        the rest of the call). Raises AIUnavailable after all keys fail or
+        AIInvalidResponse on a malformed provider reply (no key rotation —
+        the provider answered, the problem is the reply)."""
         if not self.configured:
             raise AIUnavailable("missing_api_key")
+
         payload = {
             "model": self.model,
             "messages": messages,
@@ -240,35 +256,52 @@ class OpenAICompatClient:
             "response_format": self._response_format(schema),
         }
         body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "Authorization": "Bearer " + self._api_key,
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read(65536)
-        except urllib.error.HTTPError as e:
-            code = getattr(e, "code", 0)
-            if code == 429:
-                raise AIUnavailable("http_429") from None
-            if code in _AVAIL_STATUS:
-                raise AIUnavailable("http_5xx") from None
-            if code in (401, 403):
-                raise AIUnavailable("http_auth") from None
-            # 400 (e.g. unsupported response_format) and anything else: the
-            # provider answered but we can't use it — fail closed, no retry.
-            raise AIInvalidResponse("http_status_%d" % code) from None
-        except (urllib.error.URLError, TimeoutError, OSError):
-            # Includes socket timeouts surfaced as URLError/TimeoutError.
-            raise AIUnavailable("network_or_timeout") from None
-
-        return self._parse_envelope(raw)
+        last_code = "provider_unavailable"
+        tried = 0
+        while tried < len(self._keys):
+            idx = self._key_idx % len(self._keys)
+            key = self._keys[idx]
+            tried += 1
+            req = urllib.request.Request(
+                self.base_url + "/chat/completions",
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": "Bearer " + key,
+                    # Groq's Cloudflare rejects the default python-urllib
+                    # signature with error 1010 (403) — send a bot UA instead.
+                    "User-Agent": "boss-smc-bot/1.9.4 (entry-review)",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read(65536)
+                self.last_key_number = idx + 1  # 1-based, for decision logs
+                return self._parse_envelope(raw)
+            except urllib.error.HTTPError as e:
+                code = getattr(e, "code", 0)
+                if code == 429:
+                    last_code = "http_429"
+                elif code in _AVAIL_STATUS:
+                    last_code = "http_5xx"
+                elif code in (401, 403):
+                    last_code = "http_auth"
+                else:
+                    # 400 (e.g. unsupported response_format) and anything
+                    # else: the provider answered but we can't use it —
+                    # fail closed, no retry, no key rotation.
+                    raise AIInvalidResponse(
+                        "http_status_%d" % code) from None
+                # Availability/auth failure: next attempt uses the next key.
+                self._key_idx = (idx + 1) % len(self._keys)
+                continue
+            except (urllib.error.URLError, TimeoutError, OSError):
+                last_code = "network_or_timeout"
+                self._key_idx = (idx + 1) % len(self._keys)
+                continue
+        raise AIUnavailable(last_code)
 
     def _parse_envelope(self, raw: bytes):
         envelope = strict_json(raw, max_bytes=16384, max_depth=10,

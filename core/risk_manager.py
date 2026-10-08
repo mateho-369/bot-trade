@@ -16,6 +16,7 @@
 # ============================================================
 
 import logging
+import json
 from datetime import datetime, date
 
 import MetaTrader5 as mt5
@@ -27,7 +28,15 @@ logger = logging.getLogger("RiskManager")
 
 
 class RiskState:
-    """Tracks equity/PnL context needed for the safety checks."""
+    """Tracks equity/PnL context needed for the safety checks.
+
+    PERSISTED to SMC_Bot_Data/data/risk_state.json — a restart must NEVER
+    re-baseline day_start_balance or peak_equity. (Bug fix 2026-10-07: the
+    old in-memory state reset on every restart, silently disabling the
+    daily-loss and drawdown halts for the rest of the day.)"""
+
+    _PERSIST_PATH = os.path.join(getattr(config, "DATA_ROOT_PATH", "SMC_Bot_Data"),
+                                 "data", "risk_state.json")
 
     def __init__(self):
         self.day               = date.today()
@@ -35,6 +44,36 @@ class RiskState:
         self.peak_equity       = None    # high-water mark of equity
         self.last_milestone    = None    # last withdrawal milestone alerted
         self.halted_reason     = None    # None = trading allowed
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self._PERSIST_PATH, encoding="utf-8") as f:
+                d = json.load(f)
+            self.day = date.fromisoformat(d["day"])
+            if d.get("day_start_balance") is not None:
+                self.day_start_balance = float(d["day_start_balance"])
+            if d.get("peak_equity") is not None:
+                self.peak_equity = float(d["peak_equity"])
+            self.last_milestone = d.get("last_milestone")
+            logger.info(f"Risk state loaded: day start ${self.day_start_balance}, "
+                        f"peak equity ${self.peak_equity}")
+        except FileNotFoundError:
+            pass  # first run — fresh baseline
+        except Exception as e:
+            logger.error(f"Risk state load failed ({type(e).__name__}) — "
+                         f"fresh baseline this run")
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self._PERSIST_PATH), exist_ok=True)
+            with open(self._PERSIST_PATH, "w", encoding="utf-8") as f:
+                json.dump({"day": self.day.isoformat(),
+                           "day_start_balance": self.day_start_balance,
+                           "peak_equity": self.peak_equity,
+                           "last_milestone": self.last_milestone}, f)
+        except Exception as e:
+            logger.error(f"Risk state save failed: {type(e).__name__}")
 
     def _roll_day_if_needed(self, balance):
         today = date.today()
@@ -43,6 +82,7 @@ class RiskState:
             self.day_start_balance = balance
             self.halted_reason     = None
             logger.info(f"New trading day — start balance ${balance:.2f}")
+            self._save()
 
     def update(self, account_info):
         """Refresh state from a live MT5 account_info object. Call once/loop."""
@@ -55,6 +95,7 @@ class RiskState:
 
         if self.peak_equity is None or equity > self.peak_equity:
             self.peak_equity = equity
+            self._save()
 
 
 # ── LOT SIZING ───────────────────────────────────────────────

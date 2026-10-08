@@ -3,6 +3,7 @@
 # ============================================================
 import logging
 import sys, os
+import asyncio
 from datetime import datetime
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import config
@@ -44,15 +45,22 @@ def send(message: str):
 
 
 async def _send_async(message: str):
-    try:
-        bot = Bot(token=config.TELEGRAM_TOKEN)
-        await bot.send_message(
-            chat_id=str(config.TELEGRAM_CHAT_ID),
-            text=message,
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
+    bot = Bot(token=config.TELEGRAM_TOKEN)
+    last_err = None
+    for attempt in range(3):  # bounded retry: transient timeouts must not
+        try:                   # silently drop trade/AI alerts
+            await bot.send_message(
+                chat_id=str(config.TELEGRAM_CHAT_ID),
+                text=message,
+                parse_mode="HTML",
+                read_timeout=5,
+                write_timeout=5,
+            )
+            return
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(1)
+    logger.error(f"Telegram error after 3 attempts: {last_err}")
 
 
 def _hr():
@@ -65,14 +73,14 @@ def msg_signal(symbol, direction, entry, tp, sl, atr, rsi, sig_type, ml_conf, lo
     return (
         f"{icon}  <b>BOSS SMC  ·  {direction}</b>\n"
         f"{_hr()}\n"
-        f"📊  Pair&nbsp;&nbsp;&nbsp;&nbsp;: <b>{symbol}</b>\n"
-        f"{arrow}  Side&nbsp;&nbsp;&nbsp;&nbsp;: <b>{direction}</b>\n"
-        f"💰  Entry&nbsp;&nbsp;&nbsp;: <code>{entry:.2f}</code>\n"
-        f"✅  TP&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <code>{tp:.2f}</code>\n"
-        f"❌  SL&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: <code>{sl:.2f}</code>\n"
+        f"📊  Pair    : <b>{symbol}</b>\n"
+        f"{arrow}  Side    : <b>{direction}</b>\n"
+        f"💰  Entry   : <code>{entry:.2f}</code>\n"
+        f"✅  TP      : <code>{tp:.2f}</code>\n"
+        f"❌  SL      : <code>{sl:.2f}</code>\n"
         f"{_hr()}\n"
-        f"📈 ATR: {atr:.2f}&nbsp;&nbsp;·&nbsp;&nbsp;📉 RSI: {rsi:.1f}\n"
-        f"🔍 {sig_type}&nbsp;&nbsp;·&nbsp;&nbsp;🤖 ML: {ml_conf:.0%}\n"
+        f"📈 ATR: {atr:.2f}   ·   📉 RSI: {rsi:.1f}\n"
+        f"🔍 {sig_type}   ·   🤖 ML: {ml_conf:.0%}\n"
         f"📦 Lot: {lot}\n"
     )
 
@@ -84,11 +92,11 @@ def msg_closed(symbol, direction, entry, close_price, profit, win, stats):
     return (
         f"{icon}  <b>{emoji}  ·  {symbol} {direction}</b>\n"
         f"{_hr()}\n"
-        f"💰  Entry&nbsp;&nbsp;&nbsp;: <code>{entry:.2f}</code>\n"
-        f"🏁  Close&nbsp;&nbsp;&nbsp;: <code>{close_price:.2f}</code>\n"
-        f"💵  PnL&nbsp;&nbsp;&nbsp;&nbsp;: <b>{profit:+.2f} USD</b>  ({pts:.2f} pts)\n"
+        f"💰  Entry   : <code>{entry:.2f}</code>\n"
+        f"🏁  Close  : <code>{close_price:.2f}</code>\n"
+        f"💵  PnL     : <b>{profit:+.2f} USD</b>  ({pts:.2f} pts)\n"
         f"{_hr()}\n"
-        f"🏆 Win rate: <b>{stats['winrate']:.1f}%</b>&nbsp;&nbsp;·&nbsp;&nbsp;📊 {stats['wins']}W – {stats['losses']}L\n"
+        f"🏆 Win rate: <b>{stats['winrate']:.1f}%</b>   ·   📊 {stats['wins']}W – {stats['losses']}L\n"
     )
 
 
@@ -119,8 +127,84 @@ def msg_blacklist(symbol, direction, ml_conf, pattern_type):
         f"{emoji}  <b>PATTERN {pattern_type}</b>\n"
         f"{_hr()}\n"
         f"📊 {symbol}  ·  {direction}\n"
-        f"🧠 ML: {ml_conf:.0%}&nbsp;&nbsp;·&nbsp;&nbsp;⚡ {action}\n"
+        f"🧠 ML: {ml_conf:.0%}   ·   ⚡ {action}\n"
     )
+
+def msg_ai_decision(action, symbol, direction, confidence, reason_code, reason, approved, model="", key="", appeal=""):
+    """Telegram alert for every AI entry-review decision (APPROVE / REJECT /
+    WAIT / a blocked code like CIRCUIT_OPEN or PROVIDER_UNAVAILABLE)."""
+    if action == "APPROVE":
+        icon, verdict = "🤖✅", "AI APPROVED"
+    elif action == "REJECT":
+        icon, verdict = "🤖⛔", "AI REJECTED"
+    elif action == "WAIT":
+        icon, verdict = "🤖⏸", "AI WAIT — not now"
+    else:
+        icon, verdict = "🤖⚠️", f"AI BLOCKED ({action})"
+    tail = "➡️ Running risk checks..." if approved else "🚫 Entry blocked"
+    brain = f"🧠 {model}  ·  🔑 key#{key}\n" if model else ""
+    law = f"⚖️ {appeal}\n" if appeal else ""
+    return (
+        f"{icon}  <b>{verdict}  ·  {symbol} {direction}</b>\n"
+        f"{_hr()}\n"
+        f"🧠 Confidence: <b>{confidence:.0%}</b>\n"
+        f"{brain}"
+        f"{law}"
+        f"🏷 Code: <code>{reason_code}</code>\n"
+        f"💬 {reason}\n"
+        f"{tail}\n"
+    )
+
+
+def msg_ai_position(action, symbol, direction, confidence, reason_code,
+                    reason, ticket, model="", key="", detail=""):
+    """Telegram alert for an AI action on an OPEN position (CLOSE / EXTEND).
+    HOLD decisions are journaled only — alerting every hold would spam."""
+    if action == "CLOSE":
+        icon, verdict = "🤖🔒", "AI CLOSED EARLY (2 AI voted)"
+    else:
+        icon, verdict = "🤖🎯", "AI EXTENDED TARGET (2 AI voted)"
+    brain = f"🧠 {model}  ·  🔑 {key}\n" if model else ""
+    return (
+        f"{icon}  <b>{verdict}  ·  {symbol} {direction}</b>\n"
+        f"{_hr()}\n"
+        f"🎫 Ticket: <code>{ticket}</code>\n"
+        f"🧠 Confidence: <b>{confidence:.0%}</b>\n"
+        f"{brain}"
+        f"🏷 Code: <code>{reason_code}</code>\n"
+        f"💬 {reason}\n"
+        + (f"{detail}\n" if detail else "")
+    )
+
+
+def msg_news(title):
+    """Telegram alert for a fresh major news headline."""
+    return (
+        f"📰  <b>NEWS ALERT</b>\n"
+        f"{_hr()}\n"
+        f"🕐 {datetime.utcnow():%H:%M} UTC\n"
+        f"💬 {title}\n"
+        f"🤖 The AI sees this in its next decisions\n"
+    )
+
+
+def msg_regime(regime, summary, applied):
+    """Telegram alert for AI market adaptation (self-tuned settings)."""
+    lines = [
+        f"🧬  <b>AI MARKET ADAPTATION</b>",
+        _hr(),
+        f"🌐 Regime: <b>{regime}</b>",
+        f"💬 {summary}",
+    ]
+    if applied:
+        lines.append(_hr())
+        for p, old, new, why in applied:
+            lines.append(f"⚙️ <b>{p}</b>: {old} → <b>{new}</b>")
+            lines.append(f"     ↳ {why}")
+    else:
+        lines.append("⚙️ No setting changes — current setup fits the market")
+    return "\n".join(lines) + "\n"
+
 
 def msg_milestone(m):
     return (
@@ -138,7 +222,7 @@ def msg_ml_retrain(n_trades, winrate, n_patterns):
     return (
         f"🤖  <b>ML retrained</b>\n"
         f"{_hr()}\n"
-        f"📊 Trades: {n_trades}&nbsp;&nbsp;·&nbsp;&nbsp;🏆 WR: {winrate:.1f}%\n"
+        f"📊 Trades: {n_trades}·🏆 WR: {winrate:.1f}%\n"
         f"🧩 Patterns: {n_patterns} clusters\n"
         f"✅ Saved\n"
     )

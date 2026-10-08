@@ -9,6 +9,7 @@
 # ============================================================
 
 import logging
+import time
 import MetaTrader5 as mt5
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
@@ -19,6 +20,23 @@ from core.state_logger import trade_log as _change_log, event
 logger = logging.getLogger("TradeManager")
 
 MAGIC = 505001
+
+# Rate limit for per-ticket progress lines: price flickering on a 10% bucket
+# boundary otherwise logs every second. One line per ticket per 60s, plus an
+# immediate line when progress jumps a full 20-point bucket.
+_last_progress = {}
+
+
+def _progress_log(ticket, msg, bucket):
+    now = time.monotonic()
+    prev_bucket, prev_ts = _last_progress.get(ticket, (-999, 0.0))
+    big_jump = abs(bucket - prev_bucket) >= 20
+    if (big_jump and now - prev_ts >= 15) or (now - prev_ts >= 60):
+        _change_log.log(ticket, msg)
+        _last_progress[ticket] = (bucket, now)
+        if len(_last_progress) > 128:  # bounded; drop the oldest entries
+            for k in sorted(_last_progress, key=lambda k: _last_progress[k][1])[:-64]:
+                _last_progress.pop(k, None)
 
 
 def manage_open_trade(symbol, state, df_feat, ml_model):
@@ -74,14 +92,14 @@ def manage_open_trade(symbol, state, df_feat, ml_model):
     else:
         unrealized = entry - current_price
 
-    # Change-only progress line: speaks when progress crosses a 10% bucket
-    # (or on the 60s heartbeat), instead of spamming every loop. The bucket
-    # keeps the deduped message stable; the heartbeat carries fresh numbers.
+    # Change-only progress line, rate-limited: speaks when progress crosses a
+    # 10% bucket (max one line per ticket per 60s; immediate on a 20-point
+    # jump), instead of spamming every loop.
     bucket = int(progress_pct * 10) * 10
-    _change_log.log(
+    _progress_log(
         ticket,
-        f"[{symbol}] #{ticket} {'BUY' if direction==1 else 'SELL'} | ~{bucket}% toward TP"
-    )
+        f"[{symbol}] #{ticket} {'BUY' if direction==1 else 'SELL'} | ~{bucket}% toward TP",
+        bucket)
 
     new_sl = None
     new_tp = None

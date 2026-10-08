@@ -19,7 +19,7 @@ from core.state_logger import signal_log as _sig_log
 logger = logging.getLogger("MTFEngine")
 
 # Timeframes to scan in order (fastest to slowest)
-TIMEFRAMES = ["M1", "M5", "M15"]
+# (actual list set below after the SCALPING QUALITY FLOOR note)
 
 # Weight of each timeframe signal (higher TF = more reliable)
 TF_WEIGHT = {
@@ -28,11 +28,17 @@ TF_WEIGHT = {
     "M15": 3,
 }
 
-# ATR multiplier per timeframe (higher TF = wider SL/TP)
+# SCALPING QUALITY FLOOR (2026-10-07): M1 signals dropped — live data showed
+# M1 scalps lose to spread and noise (avg win +$0.06 vs losses), while the
+# winners came from M5/M15. The engine now scans M5 + M15 only.
+TIMEFRAMES = ["M5", "M15"]
 TF_ATR_MULT = {
-    "M1":  {"sl": 1.5, "tp": 3.0},
-    "M5":  {"sl": 1.8, "tp": 3.5},
-    "M15": {"sl": 2.0, "tp": 4.0},
+    # SCALPING MODE (owner request 2026-10-07): tight targets for many
+    # small wins. Was {"M1": 3.0, "M5": 3.5, "M15": 4.0} take-profit.
+    # RR kept >= ~1.3 so the AI risk reviewer does not reject 1:1 setups.
+    "M1":  {"sl": 1.5, "tp": 2.0},
+    "M5":  {"sl": 1.8, "tp": 2.5},
+    "M15": {"sl": 2.0, "tp": 3.0},
 }
 
 
@@ -133,6 +139,27 @@ def _make_decision(symbol, results):
 
         sig    = data['signal']['signal']
         weight = data['weight']
+        rsi    = float(data['signal'].get('rsi', 50))
+        pat    = int(data['signal'].get('pattern_score', 0))
+
+        # ── RSI chop-zone filter ──────────────────────────────
+        # Block signals where RSI is in the 48-52 no-man's-land (no
+        # directional momentum). A strong candle pattern (engulf/pin)
+        # overrides because price action trumps oscillator noise.
+        if getattr(config, 'RSI_FILTER_ENABLED', True):
+            bull_min = float(getattr(config, 'RSI_BULL_MIN', 52))
+            bear_max = float(getattr(config, 'RSI_BEAR_MAX', 48))
+            override = int(getattr(config, 'RSI_CHOP_PATTERN_OVERRIDE', 2))
+            if sig == 'BUY'  and rsi < bull_min and pat < override:
+                _sig_log.log(f"{symbol}:{tf}:rsi",
+                             f"[{symbol}][{tf}] RSI-CHOP BUY blocked "
+                             f"(RSI {rsi:.1f} < {bull_min}, pattern {pat})")
+                continue
+            if sig == 'SELL' and rsi > bear_max and pat < override:
+                _sig_log.log(f"{symbol}:{tf}:rsi",
+                             f"[{symbol}][{tf}] RSI-CHOP SELL blocked "
+                             f"(RSI {rsi:.1f} > {bear_max}, pattern {pat})")
+                continue
 
         if sig == 'BUY':
             buy_score  += weight

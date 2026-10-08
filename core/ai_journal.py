@@ -87,14 +87,14 @@ class AIJournal:
     def record(self, *, symbol, timeframe, direction, engine, snapshot_hash,
                input_summary, provider, model, schema_version, feature_version,
                action, confidence, reason_code, reason, risk_flags,
-               latency_ms, cached, source, final_action,
+               latency_ms, cached, source, final_action, kind="entry",
                execution="pending", risk_result="pending") -> int:
         """Append one AI-reviewed candidate. Returns its decision_id."""
         decision_id = self._next_id()
         row = {
             "decision_id": decision_id,
             "time": pd.Timestamp.now(tz="UTC").isoformat(),
-            "kind": "entry",
+            "kind": kind,
             "symbol": symbol, "timeframe": timeframe,
             "direction": direction, "engine": engine,
             "snapshot_hash": snapshot_hash,
