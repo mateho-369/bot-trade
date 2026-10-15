@@ -169,6 +169,28 @@ def check_strategy(config):
                   f"on silence: {config.AI_ENTRY_TIMEOUT_MODE} · "
                   f"position review every {config.AI_POSITION_INTERVAL:.0f}s "
                   f"({config.AI_POSITION_VOTES} vote) · loop {config.ANALYSIS_INTERVAL_SECONDS}s")
+    if getattr(config, "SCALPER", False):
+        if config.ENTRY_ENGINE != "SMC_MTF":
+            soft(f"BOT_PROFILE=scalper but ENTRY_ENGINE={config.ENTRY_ENGINE}: a value in "
+                 f".env overrides the profile. {config.ENTRY_ENGINE} is not the fast M1 "
+                 f"scalper - delete ENTRY_ENGINE from .env.")
+        if getattr(config, "SCALP_USD_MODE", False):
+            say(INFO, f"$ scalping · target ${config.SCALP_TARGET_USD:g}/trade · "
+                      f"lot cap {config.SCALP_MAX_LOT:g} · skip when spread > "
+                      f"{config.SCALP_MAX_SPREAD_PCT_OF_TARGET:.0f}% of target · "
+                      f"min lot may skip big-contract symbols (e.g. BTC)")
+        if getattr(config, "SCALP_GUARD_ENABLED", False):
+            say(INFO, f"scalp guard · stall {config.SCALP_STALL_SECONDS:.0f}s · giveback "
+                      f"{config.SCALP_GIVEBACK_PCT:.0%} · early cut "
+                      f"{config.SCALP_EARLY_CUT_PCT:.0%} · max hold "
+                      f"{config.SCALP_MAX_HOLD_SECONDS:.0f}s")
+        if config.AI_WORKER_THREADS < 2:
+            soft(f"AI_WORKER_THREADS={config.AI_WORKER_THREADS}: with the Analyst on, "
+                 f"briefs and entry reviews share the lane - use 3 (the scalper default; "
+                 f"remove AI_WORKER_THREADS from .env).")
+        if config.AI_TIMEOUT_SECONDS > 6:
+            soft(f"AI_TIMEOUT_SECONDS={config.AI_TIMEOUT_SECONDS:g} is slow for a scalper "
+                 f"(default 4); is an old value left in .env?")
     env_file = getattr(config, "ENV_FILE_USED", "")
     if env_file:
         inside = os.path.dirname(os.path.abspath(env_file)) == \

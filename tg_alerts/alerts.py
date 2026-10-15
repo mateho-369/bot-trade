@@ -1,6 +1,7 @@
 # ============================================================
 #   tg_alerts/alerts.py  — Enhanced Telegram Alerts v1.7.2
 # ============================================================
+import html
 import logging
 import sys, os
 import asyncio
@@ -212,6 +213,37 @@ def msg_ai_position(action, symbol, direction, confidence, reason_code,
         f"🏷 Code: <code>{reason_code}</code>\n"
         f"💬 {reason}\n"
         + (f"{detail}\n" if detail else "")
+    )
+
+
+def msg_consensus(verdict, symbol, direction, bias, confidence, state, reason):
+    """v2.3: the Analyst AI and the bot compared their reads on a fresh signal."""
+    if verdict == "AGREE":
+        icon, head, tail = "🤝✅", "AI + BOT AGREE", "⚡ Fast lane: trading now"
+    else:
+        icon, head, tail = "🤝⛔", "AI ≠ BOT — the bot obeys the AI", "🚫 Entry blocked"
+    return (
+        f"{icon}  <b>{head}  ·  {symbol} {direction}</b>\n"
+        f"{_hr()}\n"
+        f"🧠 AI reads: <b>{bias}</b> ({confidence:.0%}, {state})\n"
+        f"💬 {html.escape(str(reason))}\n"
+        f"{tail}\n"
+    )
+
+
+def msg_scalp_close(kind, symbol, direction, ticket, code, detail, pnl):
+    """v2.3: a trade closed by the Scalp Guard (local rules) or the Analyst
+    (thesis flip). `kind` is 'guard' or 'analyst'."""
+    who = "SCALP GUARD" if kind == "guard" else "AI ANALYST FLIP"
+    icon = "🛡️" if kind == "guard" else "🤖🔄"
+    sign = "💰" if pnl >= 0 else "🩹"
+    return (
+        f"{icon}  <b>{who}  ·  {symbol} {direction}</b>\n"
+        f"{_hr()}\n"
+        f"🎫 Ticket: <code>{ticket}</code>\n"
+        f"🏷 Code: <code>{code}</code>\n"
+        f"💬 {html.escape(str(detail))}\n"
+        f"{sign} Closed at ~<b>{pnl:+.2f} USD</b>\n"
     )
 
 

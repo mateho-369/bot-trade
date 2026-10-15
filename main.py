@@ -43,6 +43,9 @@ from core.ai_review      import AIReviewer
 from core.ai_position    import PositionReviewer
 from core.ai_regime      import RegimeReviewer
 from core.ai_bus         import AIBus
+from core.ai_brief       import (MarketBriefer, FlipTracker, bot_view, consensus,
+                                 AGREE, CONFLICT, NEUTRAL, NO_BRIEF)
+from core                import scalp_guard
 from core                import ai_context
 from core.news           import NewsWatcher
 from core.ai_journal     import AIJournal
@@ -52,7 +55,8 @@ from tg_alerts.alerts    import (send, msg_signal, msg_closed,
                                   msg_bot_start, msg_error, msg_ml_retrain,
                                   msg_blacklist, msg_milestone,
                                   msg_ai_decision, msg_ai_position,
-                                  msg_news, msg_regime)
+                                  msg_news, msg_regime,
+                                  msg_consensus, msg_scalp_close)
 
 # ── LOGGING ──────────────────────────────────────────────────
 os.makedirs("logs",   exist_ok=True)
@@ -126,6 +130,9 @@ ai_journal            = None
 ai_reviewer           = None
 ai_position_reviewer  = None
 ai_regime             = None
+ai_briefer            = None        # v2.3 Analyst: the AI's own chart read
+flip_tracker          = FlipTracker()
+scalp_stats           = {'guard_closes': 0, 'flip_closes': 0}
 
 # News watcher — free RSS feed; major headlines go to Telegram, and every
 # recent headline is handed to the AI snapshots as untrusted DATA (never as
@@ -158,10 +165,22 @@ if config.ai_regime_on():
 elif getattr(config, 'AI_REGIME_ENABLED', False):
     logger.warning("AI_REGIME_ENABLED=true but the plumbing is missing "
                    "(AI_PROVIDER/AI_API_KEYS) — directives OFF")
+if config.ai_brief_on():
+    ai_briefer = MarketBriefer()
+    logger.info(f"AI analyst ON (brief per symbol every >= "
+                f"{config.AI_BRIEF_INTERVAL_SECONDS:.0f}s, valid "
+                f"{config.AI_BRIEF_TTL_SECONDS:.0f}s | AGREE>={config.AI_BRIEF_AGREE_CONF} "
+                f"CONFLICT>={config.AI_BRIEF_VETO_CONF} | fast lane "
+                f"{'ON' if config.AI_BRIEF_FASTLANE else 'off'} | thesis-flip close "
+                f"{'ON' if config.AI_BRIEF_FLIP_CLOSE else 'off'})")
+elif getattr(config, 'AI_BRIEF_ENABLED', False):
+    logger.warning("AI_BRIEF_ENABLED=true but the plumbing is missing "
+                   "(AI_PROVIDER/AI_API_KEYS) — analyst OFF")
 
 # The whole point of the bus: an 8s HTTP timeout in the provider must not
 # freeze break-even/trailing/reconciliation in a 0.5-1.0s loop.
-if ai_reviewer is not None or ai_position_reviewer is not None or ai_regime is not None:
+if (ai_reviewer is not None or ai_position_reviewer is not None
+        or ai_regime is not None or ai_briefer is not None):
     if getattr(config, 'AI_ASYNC', True):
         ai_bus = AIBus(workers=getattr(config, 'AI_WORKER_THREADS', 1),
                        queue_max=getattr(config, 'AI_QUEUE_MAX', 12),
@@ -342,6 +361,25 @@ def submit_position_reviews(symbol, state):
         if news_watcher is not None:
             ctx["recent_news"] = news_watcher.recent_titles(5)
         ctx["recent_performance"] = recent_performance()
+        if (getattr(config, 'SCALP_GUARD_ENABLED', False)
+                or getattr(config, 'SCALP_USD_MODE', False)):
+            # The Guardian is briefed in scalper terms: dollars, seconds, and
+            # what the other two parties (Scalp Guard, Analyst) will do anyway.
+            _opened = float(ps.get('opened_ts') or 0)
+            _b = ai_briefer.fresh(symbol) if ai_briefer is not None else None
+            ctx["scalp_mode"] = {
+                "target_usd": ps.get('target_usd', config.SCALP_TARGET_USD),
+                "stop_usd": ps.get('sl_usd'),
+                "peak_usd": round(float(ps.get('peak_usd', 0.0)), 2),
+                "seconds_open": int(time.time() - _opened) if _opened else None,
+                "scalp_guard_will": {
+                    "bank_at_usd": ps.get('target_usd', config.SCALP_TARGET_USD),
+                    "stall_after_s": config.SCALP_STALL_SECONDS,
+                    "giveback_pct": config.SCALP_GIVEBACK_PCT,
+                    "early_cut_pct_of_stop": config.SCALP_EARLY_CUT_PCT,
+                    "max_hold_s": config.SCALP_MAX_HOLD_SECONDS},
+                "analyst_brief": _b.short() if _b is not None else None,
+            }
         ai_position_reviewer.mark_reviewed(ticket)
 
         if ai_bus is None:                 # sync fallback (tests, AI_ASYNC=false)
@@ -567,6 +605,222 @@ def recent_performance():
     return out
 
 
+# ═════════════════════════════════════════════════════════════
+#   v2.3 TWIN-BRAIN SCALPER
+#     Analyst  : the AI reads the chart on its own, ahead of time (a "brief")
+#     Bot      : its own signal + its own read (bot_view), shared with the AI
+#     Guardian : AI position reviewer + the local Scalp Guard watch every trade
+# ═════════════════════════════════════════════════════════════
+def _h1_trend_cached(symbol, state):
+    """H1 trend, refreshed at most once a minute (it moves on the hour)."""
+    c = state.get('h1_trend_cache')
+    now = time.time()
+    if c and now - c[0] < 60:
+        return c[1]
+    try:
+        val = h1_trend_direction(get_candles(symbol, "H1", count=300))
+    except Exception:
+        val = None
+    state['h1_trend_cache'] = (now, val)
+    return val
+
+
+def submit_brief_refreshes(symbol, state):
+    """Analyst, stage 1: queue a fresh chart read when one is due. Never blocks.
+    The bot's own read (bot_view) travels with it — that is the 'bot shares its
+    analysis with the AI' half of the loop."""
+    if ai_briefer is None:
+        return
+    cur_bar = state.get('last_signal_bar')
+    if not ai_briefer.due(symbol, cur_bar, has_positions=bool(state['positions'])):
+        return
+    df = state.get('feature_cache')
+    if df is None or len(df) < 30 or 'atr' not in df.columns:
+        return
+    try:
+        h1 = _h1_trend_cached(symbol, state)
+        try:
+            spread = get_spread_percent(symbol)
+        except Exception:
+            spread = None
+        titles = news_watcher.recent_titles(5) if news_watcher is not None else []
+        ctx = ai_briefer.build_context(
+            symbol, df, h1_trend=h1, spread_pct=spread, news_titles=titles,
+            bot=bot_view(df, h1), performance=recent_performance())
+        meta = {'symbol': symbol, 'price': float(df['close'].iloc[-1]),
+                'atr': float(df['atr'].iloc[-1]), 'bar': cur_bar}
+    except Exception as e:
+        logger.error(f"AI brief context error ({type(e).__name__})")
+        ai_briefer.mark_submitted(symbol, cur_bar)   # no retry storm
+        return
+    meta['seq'] = ai_briefer.mark_submitted(symbol, cur_bar)
+    if ai_bus is None:                       # sync fallback (tests, AI_ASYNC=false)
+        try:
+            ai_briefer.accept(ai_briefer.analyze(ctx, meta))
+        except Exception as e:
+            ai_briefer.stats['error'] += 1
+            logger.error(f"AI brief error ({type(e).__name__})")
+        return
+    # a full queue / an answer still in flight just means: try again after the
+    # interval. A missing brief never blocks anything.
+    ai_bus.submit('brief', symbol,
+                  lambda c=ctx, m=meta: ai_briefer.analyze(c, m))
+
+
+def collect_briefs():
+    """Analyst, stage 2: store finished briefs (main thread only)."""
+    if ai_bus is None or ai_briefer is None:
+        return
+    for full_key, ok, payload in ai_bus.collect('brief'):
+        sym = full_key.partition(':')[2]
+        if not ok:
+            ai_briefer.stats['error'] += 1
+            signal_log.log(f"{sym}:brieferr",
+                           f"● AI brief {sym} unavailable "
+                           f"({type(payload).__name__}) — the bot runs on its own read")
+            continue
+        if ai_briefer.accept(payload):
+            b = payload
+            signal_log.log(
+                f"{sym}:brief",
+                f"● AI BRIEF {sym} {b.bias} | {b.state}"
+                + (" | STAND-ASIDE" if b.stand_aside else "")
+                + f" — {b.reason_code}")
+
+
+def _consult_brief(symbol, decision, cur_bar, state):
+    """Compare the bot's fresh signal with the Analyst's brief.
+
+    Returns 'block' (the AI says no), 'fastlane' (AI and bot agree: trade now,
+    the caller places it) or None (the normal entry gate decides). It does not
+    place anything itself."""
+    direction = decision['direction']
+    signal = decision['signal']
+    brief = ai_briefer.latest(symbol)
+    try:
+        _i = get_symbol_info(symbol)
+        px = float(_i.bid) if _i else None
+    except Exception:
+        px = None
+    verdict, why = consensus(direction, brief, price=px,
+                             atr=float(signal.get('atr') or 0) or None)
+    ai_briefer.stats[verdict.lower()] += 1
+    decision['ai_consensus'] = verdict
+    if brief is not None:
+        decision['ai_brief'] = brief.short()
+
+    if verdict == CONFLICT:
+        event(f"AI≠BOT {symbol} {direction} — {why} ({brief.state}); the bot "
+              f"obeys the AI, entry blocked")
+        state['ai_reject_cooldown_until'] = time.time() + float(
+            getattr(config, 'AI_REJECT_COOLDOWN_SECONDS', 20))
+        if time.time() - state.get('last_conflict_msg', 0) > 120:
+            state['last_conflict_msg'] = time.time()
+            send(msg_consensus("CONFLICT", symbol, direction, brief.bias,
+                               brief.confidence, brief.state, brief.reason))
+        return 'block'
+
+    if verdict == AGREE and getattr(config, 'AI_BRIEF_FASTLANE', False):
+        ai_briefer.stats['fastlane'] += 1
+        # log only (no Telegram): a scalper opens many trades and the open /
+        # close messages already tell the story; a chat group allows ~20
+        # messages a minute
+        event(f"AI+BOT AGREE {symbol} {direction} — {why} ({brief.state}); "
+              f"fast lane, no AI wait")
+        return 'fastlane'
+    return None
+
+
+def _scalp_size(symbol, price, sl, tp, tick):
+    """$-sized scalp: the lot that makes the TP distance worth SCALP_TARGET_USD.
+    Returns (meta, skip_reason). meta None + skip None = broker data missing,
+    use the percent-risk lot instead."""
+    target = float(config.SCALP_TARGET_USD)
+    tp_dist, sl_dist = abs(tp - price), abs(price - sl)
+    sz = risk_manager.calc_lot_for_usd(symbol, tp_dist, target,
+                                       max_lot=config.SCALP_MAX_LOT)
+    if sz is None:
+        return None, None
+    lot = sz['lot']
+    per_unit = sz['per_lot'] / tp_dist
+    sl_usd = lot * per_unit * sl_dist
+    tp_usd = sz['actual_usd']
+    cap_mult = float(config.SCALP_MAX_LOSS_MULT)
+    if cap_mult > 0 and sl_usd > cap_mult * target:
+        return None, (f"lot {lot:g} is the smallest this broker allows and the "
+                      f"stop would be worth ${sl_usd:.2f} against a ${target:g} "
+                      f"target (cap {cap_mult:g}x) — too big for a ${target:g} scalp")
+    spread_usd = lot * per_unit * abs(float(tick.ask) - float(tick.bid))
+    eff_target = min(target, tp_usd)
+    spread_cap = float(config.SCALP_MAX_SPREAD_PCT_OF_TARGET)
+    if spread_cap > 0 and eff_target > 0 and spread_usd / eff_target * 100 > spread_cap:
+        return None, (f"spread costs ${spread_usd:.2f} = "
+                      f"{spread_usd / eff_target * 100:.0f}% of the "
+                      f"${eff_target:.2f} target (cap {spread_cap:.0f}%) — "
+                      f"the market charges too much for this scalp")
+    return {'lot': lot, 'target_usd': eff_target, 'sl_usd': sl_usd,
+            'tp_usd': tp_usd, 'spread_usd': spread_usd}, None
+
+
+def _scalp_close(symbol, ps, p, code, detail, kind):
+    """Close one trade at market for the Scalp Guard / the Analyst. Main thread
+    only. Retries are spaced out so a refusing broker is not hammered."""
+    ticket = ps['ticket']
+    if time.time() - ps.get('close_try_ts', 0) < 2.0:
+        return False
+    ps['close_try_ts'] = time.time()
+    dir_str = "BUY" if ps.get('direction', 1) == 1 else "SELL"
+    pnl = float(getattr(p, 'profit', 0.0) or 0.0)
+    ok, why = close_position(symbol, ticket, f"BOSS {code}"[:31])
+    if not ok:
+        signal_log.log(f"{symbol}:{ticket}:scalpclosefail",
+                       f"● WARN {symbol} #{ticket} {code} close refused ({why}) — "
+                       f"the stop and TP on file still protect the trade")
+        return False
+    scalp_stats['guard_closes' if kind == 'guard' else 'flip_closes'] += 1
+    if kind != 'guard' and ai_briefer is not None:
+        ai_briefer.stats['flip_close'] += 1
+    event(f"{code} {symbol} {dir_str} #{ticket} — {detail} | closed ~{pnl:+.2f} USD")
+    send(msg_scalp_close(kind, symbol, dir_str, ticket, code, detail, pnl))
+    flip_tracker.forget(ticket)
+    if ai_bus is not None:
+        ai_bus.drop('position', str(ticket))
+    return True
+
+
+def scalp_watch(symbol, state):
+    """Every loop, every open trade, no network:
+       1. Scalp Guard  - bank the $ target, cut a trade that is not working
+       2. Analyst flip - the AI now says the opposite of this trade, twice
+    Both only CLOSE; neither moves or removes a stop."""
+    guard_on = bool(getattr(config, 'SCALP_GUARD_ENABLED', False)) \
+        and config.ENTRY_ENGINE != 'FLASH'
+    flip_on = ai_briefer is not None and bool(getattr(config, 'AI_BRIEF_FLIP_CLOSE', False))
+    if not (guard_on or flip_on) or not state['positions']:
+        return
+    import MetaTrader5 as mt5
+    brief = ai_briefer.fresh(symbol) if flip_on else None
+    for ps in list(state['positions']):
+        p = get_position_by_ticket(ps['ticket'])
+        if p is None:
+            continue
+        direction = 1 if p.type == mt5.ORDER_TYPE_BUY else -1
+        if guard_on:
+            d = scalp_guard.evaluate(ps, float(p.profit))
+            if d.action == 'CLOSE':
+                _scalp_close(symbol, ps, p, d.code, d.detail, 'guard')
+                continue
+        else:
+            ps.setdefault('opened_ts', time.time())
+        if brief is not None and flip_tracker.observe(
+                ps['ticket'], direction, brief, ps.get('opened_ts')):
+            _scalp_close(
+                symbol, ps, p, 'AI_THESIS_FLIP',
+                f"Analyst now reads {brief.bias} ({brief.confidence:.0%}, "
+                f"{brief.state}) against this trade: {brief.reason_code}",
+                'analyst')
+
+
 def ai_flow_summary():
     """One line of truth about the AI layer — for the heartbeat and the log."""
     parts = ["AI-entry:" + ("ON" if ai_reviewer is not None else "off"),
@@ -583,6 +837,15 @@ def ai_flow_summary():
                      config.ai_entry_budget_seconds())
         if n_silent:
             parts.append("bot-traded-without-AI=%d" % n_silent)
+    if ai_briefer is not None:
+        s = ai_briefer.stats
+        parts.append("analyst:ON briefs=%d err=%d agree=%d(fast=%d) conflict=%d "
+                     "neutral=%d none=%d" % (s['ok'], s['error'], s['agree'],
+                                             s['fastlane'], s['conflict'],
+                                             s['neutral'], s['no_brief']))
+    if getattr(config, 'SCALP_GUARD_ENABLED', False) or ai_briefer is not None:
+        parts.append("guard-closes=%d flip-closes=%d" % (
+            scalp_stats['guard_closes'], scalp_stats['flip_closes']))
     if ai_regime is not None and ai_regime.applied:
         parts.append("directives=" + ",".join(
             "%s=%s" % (k, v) for k, v in list(ai_regime.applied.items())[:4]))
@@ -721,6 +984,7 @@ def process_symbol_hf(symbol):
         # any verdict still in flight (applying a late CLOSE to a recycled
         # ticket number would be worse than not applying it).
         state.get('position_ai', {}).pop(ticket, None)
+        flip_tracker.forget(ticket)
         if ai_position_reviewer is not None:
             try:
                 ai_position_reviewer.forget(ticket)
@@ -763,6 +1027,13 @@ def process_symbol_hf(symbol):
             state['cache_time'] = now
             state['last_signal_bar'] = cur_bar
 
+    # 3b. v2.3 Analyst: keep a fresh AI chart read per symbol (never blocks)
+    if ai_briefer is not None:
+        try:
+            submit_brief_refreshes(symbol, state)
+        except Exception as e:
+            logger.error(f"AI brief submit error ({type(e).__name__})")
+
     # 4. Smart Trade Manager (Every Loop with Rate Limit)
     engine = getattr(config, 'ENTRY_ENGINE', 'SR_H1')
     now_ts = time.time()
@@ -785,6 +1056,12 @@ def process_symbol_hf(symbol):
             submit_position_reviews(symbol, state)
         except Exception as e:
             logger.error(f"AI position review error ({type(e).__name__}): {e}")
+
+    # 4b'. v2.3 Scalp Guard + Analyst thesis-flip: local, no network, every loop
+    try:
+        scalp_watch(symbol, state)
+    except Exception as e:
+        logger.error(f"scalp watch error ({type(e).__name__}): {e}")
 
     # 4c. AI entry candidates waiting for a verdict: drop the ones that will
     # never get an answer (provider dead / queue dropped). Fail-closed.
@@ -952,6 +1229,24 @@ def execute_trade(symbol, decision, cur_bar):
             except Exception:
                 pass
 
+    # ── v2.3: the Analyst's own read vs the bot's signal ─────
+    # AGREE -> fast lane (no AI wait); CONFLICT -> the bot obeys the AI;
+    # NEUTRAL / no brief -> fall through to the per-signal gate below.
+    if ai_briefer is not None:
+        try:
+            act = _consult_brief(symbol, decision, cur_bar, state)
+        except Exception as e:
+            # the Analyst failing must never cost the entry: degrade to v2.2
+            logger.error(f"AI brief consult error ({type(e).__name__})")
+            act = None
+        if act == 'block':
+            return
+        if act == 'fastlane':
+            # outside the try: an error in the order path must never be
+            # mistaken for an Analyst error and re-run through the gate
+            handle_entry_verdict(symbol, decision, cur_bar, None, state)
+            return
+
     # ── the AI gate ──────────────────────────────────────────
     review = None
     if ai_reviewer is not None and getattr(ai_reviewer, 'enabled', False):
@@ -1053,6 +1348,11 @@ def build_ai_snapshot(symbol, decision, state):
     if news_watcher is not None:
         ctx["recent_news"] = news_watcher.recent_titles(5)
     ctx["recent_performance"] = recent_performance()
+    if decision.get('ai_brief'):
+        # the Analyst's earlier, independent read: the gate sees it too, so the
+        # two AI opinions are consistent instead of two strangers
+        ctx["ai_market_brief"] = decision['ai_brief']
+        ctx["brief_consensus"] = decision.get('ai_consensus')
     return ctx
 
 
@@ -1415,6 +1715,21 @@ def _execute_trade_inner(symbol, decision, cur_bar, review, block_reason):
         # Risk-based lot sizing (compounds as balance grows)
         lot = risk_manager.calc_lot_size(symbol, price, sl, balance)
 
+        # v2.3 $ scalping: size the lot so the market's own TP distance is worth
+        # SCALP_TARGET_USD; refuse a trade the broker's minimum lot / the spread
+        # would turn into something other than a small, fast scalp.
+        scalp_meta = None
+        if getattr(config, 'SCALP_USD_MODE', False):
+            scalp_meta, _skip = _scalp_size(symbol, price, sl, tp, tick)
+            if _skip:
+                signal_log.log(f"{symbol}:scalpsize",
+                               f"● SKIP {symbol} {direction} — {_skip}")
+                if review is not None:
+                    block_reason['v'] = "scalp_size"
+                break
+            if scalp_meta is not None:
+                lot = scalp_meta['lot']
+
         # Final safety gate — blocks NEW entries on loss-limit/drawdown/margin
         allowed, reason = risk_manager.can_open_new_trade(risk_state, symbol, lot)
         if not allowed:
@@ -1437,6 +1752,16 @@ def _execute_trade_inner(symbol, decision, cur_bar, review, block_reason):
             state['positions'].append({'ticket': pos_ticket, 'entry': price, 'tp': tp, 'sl': sl,
                                        'direction': 1 if direction == 'BUY' else -1,
                                        'atr': atr, 'tf': chosen_tf})
+            # v2.3: what the Scalp Guard needs to judge this trade later
+            _sl_usd = scalp_meta['sl_usd'] if scalp_meta else None
+            if _sl_usd is None:
+                _pu = risk_manager.usd_per_price_unit(symbol)
+                _sl_usd = (abs(price - sl) * _pu * lot) if _pu else None
+            scalp_guard.note_open(
+                state['positions'][-1],
+                target_usd=(scalp_meta['target_usd'] if scalp_meta
+                            else float(config.SCALP_TARGET_USD)),
+                sl_usd=_sl_usd, lot=lot)
             if decision.get('engine') == 'FLASH' and not flash_engine.has_open_pair(state):
                 flash_engine.register_main(state, {
                     'ticket': pos_ticket, 'dir': 1 if direction == 'BUY' else -1,
@@ -1457,9 +1782,12 @@ def _execute_trade_inner(symbol, decision, cur_bar, review, block_reason):
                     logger.error(f"AI journal mark_execution failed: {type(e).__name__}")
             _info = mt5.symbol_info(symbol)
             _digits = _info.digits if _info else 5
+            _usd_note = (f" | ${scalp_meta['tp_usd']:.2f} up / "
+                         f"${scalp_meta['sl_usd']:.2f} down (spread "
+                         f"${scalp_meta['spread_usd']:.2f})") if scalp_meta else ""
             event(f"OPEN {symbol} {direction} #{pos_ticket} @ {price:.{_digits}f} "
                   f"| TF {chosen_tf} | lot {lot} | SL {sl:.{_digits}f} "
-                  f"TP {tp:.{_digits}f} | ML {ml_conf:.0%}")
+                  f"TP {tp:.{_digits}f} | ML {ml_conf:.0%}{_usd_note}")
             placed += 1
             time.sleep(0.1)
         else:
@@ -1489,7 +1817,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v2.2  —  AI ⇄ Bot flow  [{config.BOT_PROFILE}]")
+    logger.info(f"  BOSS SMC BOT  v2.3  —  Twin-brain AI ⇄ Bot  [{config.BOT_PROFILE}]")
     logger.info("=" * 57)
     logger.info(f"  engine={config.ENTRY_ENGINE} symbols={len(config.SYMBOLS)} "
                 f"loop={config.ANALYSIS_INTERVAL_SECONDS}s "
@@ -1555,6 +1883,7 @@ def main():
             # ── AI ⇄ bot lane: apply finished verdicts (never blocks) ──
             if ai_bus is not None:
                 try:
+                    collect_briefs()
                     collect_entry_verdicts()
                     apply_position_verdicts()
                     apply_regime_verdict()

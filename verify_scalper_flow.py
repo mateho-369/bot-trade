@@ -117,7 +117,7 @@ class TestScalperProfile(unittest.TestCase):
         self.assertEqual(c.ANALYSIS_INTERVAL_SECONDS, 0.3)
         self.assertEqual(c.AI_TIMEOUT_SECONDS, 4.0)
         self.assertEqual(c.AI_MAX_RETRIES, 0)
-        self.assertEqual(c.AI_POSITION_INTERVAL, 30.0)
+        self.assertEqual(c.AI_POSITION_INTERVAL, 15.0)
         self.assertEqual(c.AI_POSITION_VOTES, 1)
         self.assertEqual(c.AI_ENTRY_TIMEOUT_MODE, "proceed")
         self.assertTrue(c.ai_entry_proceeds_on_timeout())
