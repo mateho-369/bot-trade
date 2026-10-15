@@ -22,26 +22,62 @@ except Exception as e:
 # Rate limiting for modifications
 _last_mod_cache = {}
 
+# ── Non-blocking delivery (v2.2) ─────────────────────────────
+# send() used to run the HTTP call INSIDE the trading loop: with Telegram slow
+# or unreachable that is up to 3 x (5s timeout + 1s) = ~18s of frozen
+# break-even / trailing per alert — fatal for a scalper that alerts on every
+# open, close and AI decision. Now send() only enqueues (microseconds); one
+# daemon thread with its own event loop delivers. The queue is bounded and drops
+# the OLDEST alert when full, so a dead Telegram can never grow memory or block.
+import queue as _queue
+import threading as _threading
+
+_alert_q = _queue.Queue(maxsize=200)
+_worker_lock = _threading.Lock()
+_worker = None
+
+
+def _worker_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        message = _alert_q.get()
+        try:
+            loop.run_until_complete(_send_async(message))
+        except Exception as e:
+            # type name only: a raw message can carry the bot URL (= the token)
+            logger.error(f"Telegram send error ({type(e).__name__})")
+
+
+def _ensure_worker():
+    global _worker
+    with _worker_lock:
+        if _worker is None or not _worker.is_alive():
+            _worker = _threading.Thread(target=_worker_loop,
+                                        name="telegram-alerts", daemon=True)
+            _worker.start()
+
+
 def send(message: str):
     if not message or not config.TELEGRAM_ENABLED or not TELEGRAM_OK:
         return
     if config.TELEGRAM_TOKEN in ("YOUR_BOT_TOKEN", "", None):
         return
     try:
-        import asyncio
+        _ensure_worker()
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_send_async(message))
-            else:
-                loop.run_until_complete(_send_async(message))
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(_send_async(message))
-            loop.close()
+            _alert_q.put_nowait(message)
+        except _queue.Full:
+            try:
+                _alert_q.get_nowait()          # drop the oldest alert
+            except _queue.Empty:
+                pass
+            try:
+                _alert_q.put_nowait(message)
+            except _queue.Full:
+                pass
     except Exception as e:
-        logger.error(f"Telegram send error: {e}")
+        logger.error(f"Telegram enqueue error ({type(e).__name__})")
 
 
 async def _send_async(message: str):
@@ -60,7 +96,9 @@ async def _send_async(message: str):
         except Exception as e:
             last_err = e
             await asyncio.sleep(1)
-    logger.error(f"Telegram error after 3 attempts: {last_err}")
+    # type name only — never the raw text (it can contain the bot token URL)
+    logger.error(f"Telegram error after 3 attempts: "
+                 f"{type(last_err).__name__ if last_err else 'unknown'}")
 
 
 def _hr():

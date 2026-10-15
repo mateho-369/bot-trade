@@ -61,17 +61,34 @@ IF %ERRORLEVEL% NEQ 0 (
 )
 echo.
 
-REM --- 6. Make sure a .env exists (secrets file) ---
-IF EXIST ".env" (
-    echo [OK] .env found.
+REM --- 6. Secrets file: keep it OUTSIDE the repo so git can never see it ---
+REM     The bot reads, in order: %BOT_ENV_FILE%, %USERPROFILE%\.boss-bot\.env,
+REM     then .\.env (legacy, git-ignored).
+IF EXIST "%USERPROFILE%\.boss-bot\.env" (
+    echo [OK] Secrets file found: %USERPROFILE%\.boss-bot\.env
 ) ELSE (
-    IF EXIST ".env.example" (
-        copy ".env.example" ".env" >nul
-        echo [!] Created .env from template - EDIT IT with your real MT5 login,
-        echo     password, server and Telegram token before running the bot.
+    IF EXIST ".env" (
+        echo [OK] .env found in the repo folder ^(git-ignored^).
+        echo [!] Safer: move it to %USERPROFILE%\.boss-bot\.env
     ) ELSE (
-        echo [!] No .env found. The bot will use the fallback values in config.py.
+        IF EXIST ".env.example" (
+            mkdir "%USERPROFILE%\.boss-bot" >nul 2>&1
+            copy ".env.example" "%USERPROFILE%\.boss-bot\.env" >nul
+            echo [!] Created %USERPROFILE%\.boss-bot\.env from the template - EDIT IT
+            echo     with your MT5 login, password, server, Telegram token, AI key.
+            echo     It lives outside the repo, so it cannot be committed by accident.
+        ) ELSE (
+            echo [!] No .env found. Create %USERPROFILE%\.boss-bot\.env
+        )
     )
+)
+echo.
+
+REM --- 7. Turn on the commit-time secret scanner (blocks a commit with a key) ---
+git rev-parse --git-dir >nul 2>&1
+IF %ERRORLEVEL% EQU 0 (
+    git config core.hooksPath .githooks
+    echo [OK] Secret scanner enabled for git commits ^(.githooks/pre-commit^).
 )
 echo.
 

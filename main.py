@@ -69,6 +69,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BossBot")
 
+# Defence in depth for the secrets: whatever ends up in a log message — an
+# exception that carries the Telegram URL, an Authorization header, a key echoed
+# by a provider error — is masked before it reaches the file or the console.
+from core.secret_guard import install_log_redaction
+install_log_redaction(config)
+
 # Quiet noisy third-party loggers (httpx prints the full Telegram URL incl. token)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -112,6 +118,10 @@ entry_pause_until    = 0.0
 #   so AI_POSITION_ENABLED=True was silently dead.)
 # ═════════════════════════════════════════════════════════════
 ai_bus                = None
+# How often the AI could not answer an entry and the bot traded its own signal
+# (only non-zero under AI_ENTRY_TIMEOUT_MODE=proceed — the scalper policy).
+ai_entry_stats        = {'proceeded_timeout': 0, 'proceeded_ai_error': 0,
+                         'proceeded_queue_full': 0}
 ai_journal            = None
 ai_reviewer           = None
 ai_position_reviewer  = None
@@ -567,6 +577,12 @@ def ai_flow_summary():
     pend = sum(len(state_for(s).get('pending_ai') or {}) for s in config.SYMBOLS)
     if pend:
         parts.append("waiting_for_verdict=%d" % pend)
+    if ai_reviewer is not None and config.ai_entry_proceeds_on_timeout():
+        n_silent = sum(ai_entry_stats.values())
+        parts.append("entry-policy=proceed(%.1fs)" %
+                     config.ai_entry_budget_seconds())
+        if n_silent:
+            parts.append("bot-traded-without-AI=%d" % n_silent)
     if ai_regime is not None and ai_regime.applied:
         parts.append("directives=" + ",".join(
             "%s=%s" % (k, v) for k, v in list(ai_regime.applied.items())[:4]))
@@ -944,6 +960,14 @@ def execute_trade(symbol, decision, cur_bar):
         except Exception as e:
             # Any unexpected AI-layer error fails CLOSED: block the candidate,
             # never approve, never crash the loop. Log type only (no raw body).
+            # Scalper policy (AI_ENTRY_TIMEOUT_MODE=proceed): the AI being
+            # broken must not stop a fast bot — trade the bot's own signal.
+            if config.ai_entry_proceeds_on_timeout():
+                ai_entry_stats['proceeded_ai_error'] += 1
+                event(f"AI SILENT {symbol} {direction} — snapshot failed "
+                      f"({type(e).__name__}); trading the bot's own signal")
+                handle_entry_verdict(symbol, decision, cur_bar, None, state)
+                return
             logger.error(f"AI review error ({type(e).__name__}); "
                          f"entry blocked (fail-closed)")
             send(msg_error(f"AI review failed ({type(e).__name__}) — "
@@ -964,6 +988,9 @@ def execute_trade(symbol, decision, cur_bar):
             skey = ai_reviewer.snapshot_key(ctx)
             if skey in state['pending_ai']:
                 return
+            if (config.ai_entry_proceeds_on_timeout()
+                    and ai_bus.waiting('entry', f"{symbol}|{skey}")):
+                return        # the AI is still thinking about this very snapshot
             try:
                 _ti = get_symbol_info(symbol)
                 _px = float(_ti.bid) if _ti else 0.0
@@ -976,6 +1003,14 @@ def execute_trade(symbol, decision, cur_bar):
             if not ai_bus.submit('entry', f"{symbol}|{skey}",
                                  lambda c=ctx: ai_reviewer.review(c)):
                 state['pending_ai'].pop(skey, None)
+                if config.ai_entry_proceeds_on_timeout():
+                    # a saturated AI lane is "the AI could not answer" — it
+                    # must not cost a fast bot the entry
+                    ai_entry_stats['proceeded_queue_full'] += 1
+                    event(f"AI queue full {symbol} {direction} — trading the "
+                          f"bot's own signal (AI_ENTRY_TIMEOUT_MODE=proceed)")
+                    handle_entry_verdict(symbol, decision, cur_bar, None, state)
+                    return
                 event(f"AI queue full {symbol} {direction} — entry blocked "
                       f"(fail-closed: no verdict = no trade)")
                 # back off for a moment rather than hammering a provider that
@@ -987,6 +1022,12 @@ def execute_trade(symbol, decision, cur_bar):
         try:
             review = ai_reviewer.review(ctx)     # sync fallback (AI_ASYNC=false)
         except Exception as e:
+            if config.ai_entry_proceeds_on_timeout():
+                ai_entry_stats['proceeded_ai_error'] += 1
+                event(f"AI SILENT {symbol} {direction} — review raised "
+                      f"({type(e).__name__}); trading the bot's own signal")
+                handle_entry_verdict(symbol, decision, cur_bar, None, state)
+                return
             logger.error(f"AI review error ({type(e).__name__}); "
                          f"entry blocked (fail-closed)")
             send(msg_error(f"AI review failed ({type(e).__name__}) — "
@@ -1023,6 +1064,24 @@ def handle_entry_verdict(symbol, decision, cur_bar, review, state):
     the AI has exactly one voice, whichever way it arrived."""
     direction = decision['direction']
     block_reason = {'v': None}
+    if (review is not None and not review.approved
+            and getattr(review, 'source', '') in ('ai_unavailable', 'ai_error')
+            and config.ai_entry_proceeds_on_timeout()):
+        # The AI could not ANSWER (provider down, rate limit, open circuit,
+        # unparseable reply). That is not a REJECT: under the scalper policy
+        # the bot trades its own signal. A genuine REJECT/WAIT never reaches
+        # this branch and stays final.
+        ai_entry_stats['proceeded_ai_error'] += 1
+        event(f"AI SILENT {symbol} {direction} — {review.reason_code}; trading "
+              f"the bot's own signal (AI_ENTRY_TIMEOUT_MODE=proceed)")
+        try:
+            ai_reviewer.journal.mark_execution(
+                review.decision_id, risk_result="not_reached",
+                execution="not_executed",
+                final_action="ai_unavailable_bot_proceeded")
+        except Exception as e:
+            logger.error(f"AI journal annotate failed: {type(e).__name__}")
+        review = None
     if review is not None:
         # Telegram: surface every AI decision (APPROVE / REJECT / WAIT /
         # blocked) so the owner sees the AI gate working in real time.
@@ -1074,14 +1133,71 @@ def sweep_pending_entries(symbol, state):
     if not state.get('pending_ai'):
         return
     max_age = float(getattr(config, 'AI_ENTRY_MAX_AGE_SECONDS', 45))
+    # Scalper policy: the AI gets a short latency BUDGET. When it is spent and
+    # the AI is still silent, the bot trades its own signal (freshness and all
+    # deterministic risk gates still apply). Otherwise: no verdict = no trade.
+    budget = config.ai_entry_budget_seconds() if \
+        config.ai_entry_proceeds_on_timeout() else 0.0
     for skey, cand in list(state['pending_ai'].items()):
-        if time.time() - cand['ts'] <= max_age:
+        age = time.time() - cand['ts']
+        if budget > 0 and age >= budget:
+            state['pending_ai'].pop(skey, None)
+            _proceed_without_ai(
+                symbol, cand, state, 'proceeded_timeout',
+                f"no AI answer within {budget:.1f}s")
+            continue
+        if age <= max_age:
             continue
         state['pending_ai'].pop(skey, None)
         event(f"AI verdict TIMEOUT {symbol} {cand['decision']['direction']} — no "
               f"answer in {max_age:.0f}s; entry dropped (fail-closed)")
         signal_log.log(f"{symbol}:aitimeout",
                        f"● {symbol} AI entry verdict timed out — no trade")
+
+
+def _stale_reason(sym, cand, max_age, max_drift):
+    """Why a waiting candidate may no longer be traded — or None while it is
+    still the trade on offer. Returns (journal_tag, event_text). One definition
+    shared by the verdict collector and the timeout-proceed path, so 'is this
+    still the same trade?' has exactly one answer."""
+    age = time.time() - cand['ts']
+    if age > max_age:
+        return ('ai_verdict_stale',
+                f"AI verdict STALE {sym} — {age:.0f}s old (>{max_age:.0f}s); "
+                f"entry dropped")
+    if _get_cur_bar(sym, cand.get('scan_tf', 'M1')) != cand['cur_bar']:
+        return ('ai_verdict_stale_bar',
+                f"AI verdict STALE {sym} — the signal bar rolled over while the "
+                f"AI thought; entry dropped (a new scan re-arms)")
+    if max_drift > 0 and cand.get('atr'):
+        try:
+            ti = get_symbol_info(sym)
+            px = float(ti.bid) if ti else 0.0
+        except Exception:
+            px = 0.0
+        if px and cand['price']:
+            drift = abs(px - cand['price']) / cand['atr']
+            if drift > max_drift:
+                return ('ai_verdict_stale_drift',
+                        f"AI verdict STALE {sym} — price moved {drift:.2f} ATR "
+                        f"since the snapshot (>{max_drift}); entry dropped")
+    return None
+
+
+def _proceed_without_ai(sym, cand, state, stat, why):
+    """The AI could not answer inside the budget: trade the bot's OWN signal,
+    but only if the candidate is still fresh (same bar, price inside the drift
+    budget). Every deterministic gate in _execute_trade_inner still runs."""
+    max_age = float(getattr(config, 'AI_ENTRY_MAX_AGE_SECONDS', 45))
+    max_drift = float(getattr(config, 'AI_ENTRY_MAX_DRIFT_ATR', 0.5))
+    stale = _stale_reason(sym, cand, max_age, max_drift)
+    if stale is not None:
+        event(stale[1] + " (AI silent — no trade)")
+        return
+    ai_entry_stats[stat] += 1
+    event(f"AI SILENT {sym} {cand['decision']['direction']} — {why}; trading "
+          f"the bot's own signal (AI_ENTRY_TIMEOUT_MODE=proceed)")
+    handle_entry_verdict(sym, cand['decision'], cand['cur_bar'], None, state)
 
 
 def collect_entry_verdicts():
@@ -1099,38 +1215,29 @@ def collect_entry_verdicts():
         state = state_for(sym)
         cand = state.get('pending_ai', {}).pop(skey, None)
         if cand is None:
-            continue                      # already swept — do not act on ghosts
+            # Already swept (timeout / bot traded without it) — never act on a
+            # ghost, but do not leave its journal row "pending" forever either:
+            # the AI's memory must show the verdict arrived too late to matter.
+            if ok:
+                _finalize_ai('ai_verdict_late_unused',
+                             getattr(payload, 'decision_id', 0))
+            continue
         if not ok:
+            if config.ai_entry_proceeds_on_timeout():
+                _proceed_without_ai(
+                    sym, cand, state, 'proceeded_ai_error',
+                    f"AI job raised ({type(payload).__name__})")
+                continue
             logger.error(f"AI entry review raised ({type(payload).__name__}) for "
                          f"{sym} — entry blocked (fail-closed)")
             send(msg_error(f"AI review raised ({type(payload).__name__}) — "
                            f"entry blocked (fail-closed)"))
             continue
-        age = time.time() - cand['ts']
-        if age > max_age:
-            event(f"AI verdict STALE {sym} — {age:.0f}s old (>{max_age:.0f}s); "
-                  f"entry dropped")
-            _finalize_ai('ai_verdict_stale', getattr(payload, 'decision_id', 0))
+        stale = _stale_reason(sym, cand, max_age, max_drift)
+        if stale is not None:
+            event(stale[1])
+            _finalize_ai(stale[0], getattr(payload, 'decision_id', 0))
             continue
-        if _get_cur_bar(sym, cand.get('scan_tf', 'M1')) != cand['cur_bar']:
-            event(f"AI verdict STALE {sym} — the signal bar rolled over while the "
-                  f"AI thought; entry dropped (a new scan re-arms)")
-            _finalize_ai('ai_verdict_stale_bar', getattr(payload, 'decision_id', 0))
-            continue
-        if max_drift > 0 and cand.get('atr'):
-            try:
-                ti = get_symbol_info(sym)
-                px = float(ti.bid) if ti else 0.0
-            except Exception:
-                px = 0.0
-            if px and cand['price']:
-                drift = abs(px - cand['price']) / cand['atr']
-                if drift > max_drift:
-                    event(f"AI verdict STALE {sym} — price moved {drift:.2f} ATR "
-                          f"since the snapshot (>{max_drift}); entry dropped")
-                    _finalize_ai('ai_verdict_stale_drift',
-                                 getattr(payload, 'decision_id', 0))
-                    continue
         handle_entry_verdict(sym, cand['decision'], cand['cur_bar'], payload, state)
 
 
@@ -1382,7 +1489,7 @@ def _in_session():
 
 def main():
     logger.info("=" * 57)
-    logger.info(f"  BOSS SMC BOT  v2.1  —  AI ⇄ Bot flow  [{config.BOT_PROFILE}]")
+    logger.info(f"  BOSS SMC BOT  v2.2  —  AI ⇄ Bot flow  [{config.BOT_PROFILE}]")
     logger.info("=" * 57)
     logger.info(f"  engine={config.ENTRY_ENGINE} symbols={len(config.SYMBOLS)} "
                 f"loop={config.ANALYSIS_INTERVAL_SECONDS}s "

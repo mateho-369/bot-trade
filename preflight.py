@@ -161,8 +161,23 @@ def check_strategy(config):
         soft("SMC_MTF is this repo's own measured loser (PF 0.93 after Exness spread). "
              "Use ENTRY_ENGINE=SR_H1 (PF 1.15) unless you are testing on demo.")
     if config.ULTRA_FAST:
-        soft("BOT_PROFILE=ultra_fast disables RSI/ATR-expansion/blacklist/ML-confidence "
-             "and widens loss limits — demo only.")
+        soft(f"BOT_PROFILE={config.BOT_PROFILE} disables RSI/ATR-expansion/blacklist/"
+             f"ML-confidence and widens loss limits — demo only.")
+    if getattr(config, "SCALPER", False):
+        say(INFO, f"scalper AI lane · AI timeout {config.AI_TIMEOUT_SECONDS}s · "
+                  f"entry budget {config.ai_entry_budget_seconds():.1f}s · "
+                  f"on silence: {config.AI_ENTRY_TIMEOUT_MODE} · "
+                  f"position review every {config.AI_POSITION_INTERVAL:.0f}s "
+                  f"({config.AI_POSITION_VOTES} vote) · loop {config.ANALYSIS_INTERVAL_SECONDS}s")
+    env_file = getattr(config, "ENV_FILE_USED", "")
+    if env_file:
+        inside = os.path.dirname(os.path.abspath(env_file)) == \
+            os.path.dirname(os.path.abspath(config.__file__))
+        if inside:
+            soft(f"secrets are read from the repo folder ({env_file}). It is git-ignored, "
+                 f"but safer outside the repo: move it to ~/.boss-bot/.env")
+        else:
+            say(OK, f"secrets file is outside the repo: {env_file}")
     if config.MAX_SPREAD_COST_PCT <= 0:
         soft("MAX_SPREAD_COST_PCT=0 → the cost gate is OFF: the bot can take trades whose "
              "spread is a big share of the stop (the #1 documented reason for losing).")

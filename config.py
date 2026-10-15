@@ -18,9 +18,26 @@
 
 import os
 
+# ── Where secrets are read from (first file that exists wins) ───────────────
+#   1. $BOT_ENV_FILE                 explicit path, anywhere on disk
+#   2. ~/.boss-bot/.env              OUTSIDE the repo: `git add .` can never
+#                                    pick it up, and deleting/re-cloning the
+#                                    repo cannot touch it. RECOMMENDED.
+#   3. <repo>/.env                   legacy location (git-ignored)
+# Real environment variables always beat any file (override=False), so a
+# server / CI can inject secrets without writing a file at all.
+_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_CANDIDATES = [
+    os.getenv("BOT_ENV_FILE", "").strip(),
+    os.path.join(os.path.expanduser("~"), ".boss-bot", ".env"),
+    os.path.join(_REPO_DIR, ".env"),
+]
+ENV_FILE_USED = next((p for p in _ENV_CANDIDATES if p and os.path.isfile(p)), "")
+
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+    if ENV_FILE_USED:
+        load_dotenv(ENV_FILE_USED, override=False)
 except Exception:
     pass
 
@@ -72,11 +89,19 @@ TIMEFRAME = "M1"
 # "ultra_fast" : the v2.0 speed profile (M1 engine, permissive filters,
 #                0.5s loop). Kept byte-for-byte so nothing is lost — but it
 #                is documented as a LOSING edge profile, use on demo only.
+# "scalper"    : ultra_fast's trading settings PLUS an AI lane tuned for speed:
+#                short AI timeouts, a hard per-entry latency budget (a slow or
+#                dead AI can no longer cost you the entry — the bot proceeds on
+#                its own signal), 1-vote position reviews every 30s, 0.3s loop.
+#                The AI still vetoes when it answers in time; it just never
+#                holds the trade hostage. Demo first: it is built to trade a lot.
 BOT_PROFILE = _str_env("BOT_PROFILE", "balanced").lower()
-if BOT_PROFILE not in ("balanced", "ultra_fast"):
+if BOT_PROFILE not in ("balanced", "ultra_fast", "scalper"):
     BOT_PROFILE = "balanced"
 
-ULTRA_FAST = (BOT_PROFILE == "ultra_fast")
+SCALPER    = (BOT_PROFILE == "scalper")
+# every existing `ULTRA_FAST` switch below also applies to the scalper profile
+ULTRA_FAST = BOT_PROFILE in ("ultra_fast", "scalper")
 
 # ── SMC Signal Settings ──────────────────────────────────────
 SWING_LEN     = 5
@@ -84,7 +109,7 @@ TP_MULT       = 1.3 if ULTRA_FAST else 2.0
 SL_MULT       = 1.3 if ULTRA_FAST else 1.6
 ATR_LEN       = 14
 EMA_LEN       = 200
-COOLDOWN_BARS = 3 if ULTRA_FAST else 5
+COOLDOWN_BARS = 2 if SCALPER else (3 if ULTRA_FAST else 5)
 MIN_ATR_MULT  = 0.6 if ULTRA_FAST else 0.8
 DISP_MULT     = 0.4
 
@@ -135,7 +160,7 @@ TRAIL_STAGE_3_ATR_MULT = 0.6
 SL_BUFFER_ENABLED = False      # widening a stop is the one thing AI must not
 
 # ── Loop Speed ──────────────────────────────────────────────
-ANALYSIS_INTERVAL_SECONDS  = 0.5 if ULTRA_FAST else 1.0
+ANALYSIS_INTERVAL_SECONDS  = 0.3 if SCALPER else (0.5 if ULTRA_FAST else 1.0)
 MIN_ORDER_INTERVAL_SECONDS = 0.3
 
 DATA_ROOT_PATH = "SMC_Bot_Data"
@@ -234,25 +259,29 @@ AI_MIN_CONFIDENCE   = _float_env("AI_MIN_CONFIDENCE", 0.60)
 # role 2 — position manager (HOLD / CLOSE / EXTEND). Fail-SAFE: no verdict
 # = keep the deterministic protections. Independent of role 1 since v2.1.
 AI_POSITION_ENABLED        = _bool_env("AI_POSITION_ENABLED", True)
-AI_POSITION_INTERVAL       = 300.0 if ULTRA_FAST else 900.0
+AI_POSITION_INTERVAL       = _float_env("AI_POSITION_INTERVAL",
+                                        30.0 if SCALPER else
+                                        (300.0 if ULTRA_FAST else 900.0))
 AI_POSITION_MIN_CONFIDENCE = _float_env("AI_POSITION_MIN_CONFIDENCE", 0.60)
 AI_EXTEND_MIN_PROGRESS     = _float_env("AI_EXTEND_MIN_PROGRESS",
                                        0.85 if ULTRA_FAST else 0.90)
 AI_EXTEND_TP_MULT          = _float_env("AI_EXTEND_TP_MULT", 1.15)
 AI_EXTEND_LOCK_PCT         = _float_env("AI_EXTEND_LOCK_PCT", 0.80)
 AI_POSITION_SCHEMA_VERSION = "position_review_v2"
-AI_POSITION_VOTES          = _int_env("AI_POSITION_VOTES", 2)  # EXTEND needs agreement
+# EXTEND needs agreement — but each extra vote is one more provider round-trip
+# on a trade that lives for minutes, so the scalper asks once.
+AI_POSITION_VOTES          = _int_env("AI_POSITION_VOTES", 1 if SCALPER else 2)
 AI_POSITION_MODEL_2        = _str_env("AI_POSITION_MODEL_2", "")
 AI_POSITION_MAX_TOKENS     = _int_env("AI_POSITION_MAX_TOKENS", 500)
 # role 3 — market adaptation / bot directives (bounded, clamped, expiring).
 AI_REGIME_ENABLED        = _bool_env("AI_REGIME_ENABLED", True)
-AI_REGIME_INTERVAL       = 3600.0 if ULTRA_FAST else 7200.0
+AI_REGIME_INTERVAL       = 1800.0 if SCALPER else (3600.0 if ULTRA_FAST else 7200.0)
 AI_REGIME_MODEL          = _str_env("AI_REGIME_MODEL", "")
 AI_REGIME_SCHEMA_VERSION = "market_adaptation_v2"
 
 # shared transport / protection
-AI_TIMEOUT_SECONDS          = _float_env("AI_TIMEOUT_SECONDS", 8.0)
-AI_MAX_RETRIES              = _int_env("AI_MAX_RETRIES", 1)
+AI_TIMEOUT_SECONDS          = _float_env("AI_TIMEOUT_SECONDS", 4.0 if SCALPER else 8.0)
+AI_MAX_RETRIES              = _int_env("AI_MAX_RETRIES", 0 if SCALPER else 1)
 AI_CIRCUIT_FAILURES         = _int_env("AI_CIRCUIT_FAILURES", 5)
 AI_CIRCUIT_COOLDOWN_SECONDS = _float_env("AI_CIRCUIT_COOLDOWN_SECONDS", 120.0)
 AI_MAX_OUTPUT_TOKENS        = _int_env("AI_MAX_OUTPUT_TOKENS", 400)
@@ -266,7 +295,7 @@ AI_FEATURE_VERSION          = _str_env("AI_FEATURE_VERSION",
 # The AI runs on its own worker thread so a slow/rate-limited provider can
 # never freeze break-even, trailing or trade reconciliation in the hot loop.
 AI_ASYNC                = _bool_env("AI_ASYNC", True)   # False = call AI inline (v2.0 behaviour, demo only)
-AI_WORKER_THREADS       = _int_env("AI_WORKER_THREADS", 1)
+AI_WORKER_THREADS       = _int_env("AI_WORKER_THREADS", 2 if SCALPER else 1)
 AI_QUEUE_MAX            = _int_env("AI_QUEUE_MAX", 12)   # extra work is refused
 AI_RESULT_TTL_SECONDS   = _float_env("AI_RESULT_TTL_SECONDS", 120.0)
 # Backpressure: when the queue is full the candidate is dropped AND the scan
@@ -274,11 +303,33 @@ AI_RESULT_TTL_SECONDS   = _float_env("AI_RESULT_TTL_SECONDS", 120.0)
 AI_QUEUE_BACKOFF_SECONDS = _float_env("AI_QUEUE_BACKOFF_SECONDS", 10.0)
 # After an AI REJECT, wait before asking again about the same symbol — the
 # market did not change in 3 seconds, and each ask costs a provider call.
-AI_REJECT_COOLDOWN_SECONDS = _float_env("AI_REJECT_COOLDOWN_SECONDS", 45.0)
+AI_REJECT_COOLDOWN_SECONDS = _float_env("AI_REJECT_COOLDOWN_SECONDS",
+                                        20.0 if SCALPER else 45.0)
 # entry: a candidate waits at most this long for a verdict; older results are
 # dropped as STALE and a fresh scan re-arms.
-AI_ENTRY_MAX_AGE_SECONDS = _float_env("AI_ENTRY_MAX_AGE_SECONDS", 45.0)
-AI_ENTRY_MAX_DRIFT_ATR   = _float_env("AI_ENTRY_MAX_DRIFT_ATR", 0.5)
+AI_ENTRY_MAX_AGE_SECONDS = _float_env("AI_ENTRY_MAX_AGE_SECONDS",
+                                      10.0 if SCALPER else 45.0)
+AI_ENTRY_MAX_DRIFT_ATR   = _float_env("AI_ENTRY_MAX_DRIFT_ATR",
+                                      0.30 if SCALPER else 0.5)
+
+# ── Entry latency budget (v2.2 scalper) ──────────────────────
+# How long a candidate waits for the AI before the TIMEOUT POLICY applies.
+#   AI_ENTRY_TIMEOUT_MODE = "block"   : no verdict = no trade (the v2.1 contract,
+#                                       default for balanced / ultra_fast)
+#   AI_ENTRY_TIMEOUT_MODE = "proceed" : no verdict inside the budget = the bot
+#                                       trades its OWN signal (all deterministic
+#                                       risk gates still run). A real REJECT from
+#                                       the AI is always final — only silence,
+#                                       errors, an open circuit or a full queue
+#                                       are treated as "AI could not answer".
+# Budget 0 = no early deadline in "block" mode (the candidate lives until
+# AI_ENTRY_MAX_AGE); in "proceed" mode it falls back to 3s.
+AI_ENTRY_TIMEOUT_MODE    = _str_env("AI_ENTRY_TIMEOUT_MODE",
+                                    "proceed" if SCALPER else "block").lower()
+if AI_ENTRY_TIMEOUT_MODE not in ("block", "proceed"):
+    AI_ENTRY_TIMEOUT_MODE = "block"
+AI_ENTRY_BUDGET_SECONDS  = _float_env("AI_ENTRY_BUDGET_SECONDS",
+                                      3.0 if SCALPER else 0.0)
 # position: CLOSE/EXTEND is applied only if the trade still looks like the one
 # the AI reviewed (progress moved less than this fraction).
 AI_POSITION_MAX_DRIFT_PROGRESS = _float_env("AI_POSITION_MAX_DRIFT_PROGRESS", 0.15)
@@ -360,6 +411,27 @@ def ai_any_on():
     return ai_entry_on() or ai_position_on() or ai_regime_on()
 
 
+def ai_entry_proceeds_on_timeout():
+    """True when 'the AI could not answer in time' means 'trade the bot's own
+    signal' instead of 'no trade'. A real REJECT is never overridden."""
+    return str(globals().get("AI_ENTRY_TIMEOUT_MODE", "block")) == "proceed"
+
+
+def ai_entry_budget_seconds():
+    """The per-entry AI latency budget, clamped to stay inside the freshness
+    window (a budget >= AI_ENTRY_MAX_AGE would drop every late candidate as
+    STALE before the timeout policy could act). 0 = no early deadline."""
+    budget = float(globals().get("AI_ENTRY_BUDGET_SECONDS", 0.0) or 0.0)
+    max_age = float(globals().get("AI_ENTRY_MAX_AGE_SECONDS", 45.0) or 45.0)
+    if budget <= 0:
+        # In "proceed" mode a deadline is what makes the policy mean anything,
+        # so a 0 budget falls back to 3s. In "block" mode 0 = no early deadline.
+        if not ai_entry_proceeds_on_timeout():
+            return 0.0
+        budget = 3.0
+    return min(budget, max_age * 0.8)
+
+
 def ai_status_lines():
     """Human-readable 'what is actually running' report for startup logs.
 
@@ -382,4 +454,17 @@ def ai_status_lines():
                        " (add AI_API_KEYS to .env or set the flag false)")
         else:
             out.append(f"{label}: off")
+    if ai_entry_on():
+        budget = ai_entry_budget_seconds()
+        if ai_entry_proceeds_on_timeout() and budget > 0:
+            out.append(f"AI entry latency: {budget:.1f}s budget -> if the AI has "
+                       f"not answered, the bot trades its own signal "
+                       f"(a real REJECT is still final)")
+        else:
+            out.append("AI entry latency: no verdict = no trade (fail-closed)")
+    if ENV_FILE_USED:
+        out.append("secrets file: " + (
+            "INSIDE the repo (git-ignored) - move it to ~/.boss-bot/.env"
+            if os.path.dirname(os.path.abspath(ENV_FILE_USED)) == _REPO_DIR
+            else "outside the repo (good)"))
     return out

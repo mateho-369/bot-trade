@@ -1,0 +1,13 @@
+#!/bin/sh
+# Blocks a commit that contains a secret. Enable once per clone:
+#     git config core.hooksPath .githooks
+# (install.bat does this for you.)
+cd "$(git rev-parse --show-toplevel)" || exit 1
+for PY in python python3 py; do
+  if command -v "$PY" >/dev/null 2>&1; then
+    "$PY" tools/scan_secrets.py --staged
+    exit $?
+  fi
+done
+echo "pre-commit: Python not found - secret scan SKIPPED" >&2
+exit 0
