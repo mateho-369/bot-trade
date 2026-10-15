@@ -66,12 +66,12 @@ echo ----------------------------------------------------------------------
 
 if "%EXITCODE%"=="0" (
     echo [%date% %time%] Clean exit. Restarting in 5 seconds... ^(Ctrl+C to stop^)
-    timeout /t 5 /nobreak >nul
+    %SystemRoot%\System32\ping.exe -n 6 127.0.0.1 >nul
     goto start
 )
 
 echo [%date% %time%] Error exit - restarting in 20 seconds to avoid a fast crash loop.
 echo [%date% %time%] Common causes: MT5 terminal closed, "Allow algorithmic trading"
 echo [%date% %time%] unchecked, broker disconnected, or SYMBOLS suffix mismatch.
-timeout /t 20 /nobreak >nul
+%SystemRoot%\System32\ping.exe -n 21 127.0.0.1 >nul
 goto start

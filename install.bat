@@ -12,7 +12,7 @@ IF %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Python not found!
     echo Download from: https://www.python.org/downloads/
     echo Make sure to check "Add Python to PATH" during install.
-    echo Use Python 3.10 - 3.12 (64-bit): MetaTrader5 and numpy wheels for
+    echo Use Python 3.10 - 3.12 ^(64-bit^): MetaTrader5 and numpy wheels for
     echo newer versions may not exist, which breaks this install step.
     pause
     exit /b 1
