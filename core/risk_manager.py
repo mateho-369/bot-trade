@@ -154,6 +154,51 @@ def calc_lot_size(symbol, entry, sl, balance):
     return lot
 
 
+def usd_per_price_unit(symbol):
+    """Account-currency value of a 1.0 PRICE move on 1.0 lot, from the broker's
+    tick value/size. None when the broker does not say."""
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        return None
+    tv = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+    ts = float(getattr(info, "trade_tick_size", 0.0) or 0.0)
+    if tv <= 0 or ts <= 0:
+        return None
+    return tv / ts
+
+
+def calc_lot_for_usd(symbol, distance, usd, max_lot=None):
+    """Lot such that a price move of `distance` is worth about `usd`.
+
+    The scalper sizes by DOLLARS, not by percent of balance: "$3 if it goes my
+    way, about $3 if it does not". Returns None when the broker data is
+    missing (caller falls back to the percent-risk lot). Otherwise a dict:
+        lot          broker-valid lot (step/min/max/SCALP_MAX_LOT applied)
+        per_lot      $ value of `distance` on 1.0 lot
+        actual_usd   what `distance` is really worth at the chosen lot
+        min_clamped  the broker minimum is larger than the target needs
+        max_clamped  the lot cap stopped us reaching the target
+    """
+    per_unit = usd_per_price_unit(symbol)
+    if per_unit is None or distance <= 0 or usd <= 0:
+        return None
+    info = mt5.symbol_info(symbol)
+    per_lot = distance * per_unit
+    raw = usd / per_lot
+    lot_min = float(getattr(info, "volume_min", 0.01) or 0.01)
+    lot_max = float(getattr(info, "volume_max", 100.0) or 100.0)
+    lot_step = float(getattr(info, "volume_step", 0.01) or 0.01)
+    cap = lot_max if max_lot is None else min(lot_max, float(max_lot))
+    # round DOWN to the step: never size above the dollar target
+    stepped = _round_to_step(int(raw / lot_step + 1e-9) * lot_step, lot_step)
+    lot = max(lot_min, min(stepped, cap))
+    return {
+        "lot": lot, "per_lot": per_lot, "actual_usd": lot * per_lot,
+        "min_clamped": lot_min > stepped and lot == lot_min,
+        "max_clamped": lot == cap and stepped > cap,
+    }
+
+
 # ── POSITION COUNT ───────────────────────────────────────────
 
 def positions_allowed(balance):

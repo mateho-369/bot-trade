@@ -1,10 +1,19 @@
-# Secrets
+# Secrets - NEVER commit. Prefer keeping the real file OUTSIDE the repo:
+#   ~/.boss-bot/.env   (or point $BOT_ENV_FILE at it)
 .env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+secrets/
+credentials*.json
 
 # Python
 __pycache__/
 *.pyc
 venv/
+.venv/
 .dist/
 
 # Logs & runtime data

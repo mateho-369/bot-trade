@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 echo ============================================
-echo   BOSS SMC BOT v2.1 - Starting (single run)
+echo   BOSS SMC BOT v2.3 - Starting (single run)
 echo ============================================
 
 if not exist "venv\Scripts\python.exe" (
@@ -20,9 +20,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist ".env" (
-    echo [!] No .env file - the bot will run on the fallback values in config.py.
-    echo     Copy .env.example to .env and fill in your MT5 account for AI + symbols.
+REM The secrets file lives OUTSIDE the repo since v2.2:
+REM   %BOT_ENV_FILE%  or  %USERPROFILE%\.boss-bot\.env  (legacy: .\.env)
+set "SECRETS_OK="
+if exist ".env" set "SECRETS_OK=1"
+if exist "%USERPROFILE%\.boss-bot\.env" set "SECRETS_OK=1"
+if defined BOT_ENV_FILE set "SECRETS_OK=1"
+if not defined SECRETS_OK (
+    echo [!] No secrets file found - the bot would run on the fallback values in
+    echo     config.py ^(no MT5 login, AI disabled^). Create
+    echo     %USERPROFILE%\.boss-bot\.env  from .env.example and fill it in.
     echo.
 )
 

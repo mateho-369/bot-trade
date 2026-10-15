@@ -1,6 +1,7 @@
 # ============================================================
 #   tg_alerts/alerts.py  — Enhanced Telegram Alerts v1.7.2
 # ============================================================
+import html
 import logging
 import sys, os
 import asyncio
@@ -22,26 +23,62 @@ except Exception as e:
 # Rate limiting for modifications
 _last_mod_cache = {}
 
+# ── Non-blocking delivery (v2.2) ─────────────────────────────
+# send() used to run the HTTP call INSIDE the trading loop: with Telegram slow
+# or unreachable that is up to 3 x (5s timeout + 1s) = ~18s of frozen
+# break-even / trailing per alert — fatal for a scalper that alerts on every
+# open, close and AI decision. Now send() only enqueues (microseconds); one
+# daemon thread with its own event loop delivers. The queue is bounded and drops
+# the OLDEST alert when full, so a dead Telegram can never grow memory or block.
+import queue as _queue
+import threading as _threading
+
+_alert_q = _queue.Queue(maxsize=200)
+_worker_lock = _threading.Lock()
+_worker = None
+
+
+def _worker_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        message = _alert_q.get()
+        try:
+            loop.run_until_complete(_send_async(message))
+        except Exception as e:
+            # type name only: a raw message can carry the bot URL (= the token)
+            logger.error(f"Telegram send error ({type(e).__name__})")
+
+
+def _ensure_worker():
+    global _worker
+    with _worker_lock:
+        if _worker is None or not _worker.is_alive():
+            _worker = _threading.Thread(target=_worker_loop,
+                                        name="telegram-alerts", daemon=True)
+            _worker.start()
+
+
 def send(message: str):
     if not message or not config.TELEGRAM_ENABLED or not TELEGRAM_OK:
         return
     if config.TELEGRAM_TOKEN in ("YOUR_BOT_TOKEN", "", None):
         return
     try:
-        import asyncio
+        _ensure_worker()
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_send_async(message))
-            else:
-                loop.run_until_complete(_send_async(message))
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(_send_async(message))
-            loop.close()
+            _alert_q.put_nowait(message)
+        except _queue.Full:
+            try:
+                _alert_q.get_nowait()          # drop the oldest alert
+            except _queue.Empty:
+                pass
+            try:
+                _alert_q.put_nowait(message)
+            except _queue.Full:
+                pass
     except Exception as e:
-        logger.error(f"Telegram send error: {e}")
+        logger.error(f"Telegram enqueue error ({type(e).__name__})")
 
 
 async def _send_async(message: str):
@@ -60,7 +97,9 @@ async def _send_async(message: str):
         except Exception as e:
             last_err = e
             await asyncio.sleep(1)
-    logger.error(f"Telegram error after 3 attempts: {last_err}")
+    # type name only — never the raw text (it can contain the bot token URL)
+    logger.error(f"Telegram error after 3 attempts: "
+                 f"{type(last_err).__name__ if last_err else 'unknown'}")
 
 
 def _hr():
@@ -174,6 +213,37 @@ def msg_ai_position(action, symbol, direction, confidence, reason_code,
         f"🏷 Code: <code>{reason_code}</code>\n"
         f"💬 {reason}\n"
         + (f"{detail}\n" if detail else "")
+    )
+
+
+def msg_consensus(verdict, symbol, direction, bias, confidence, state, reason):
+    """v2.3: the Analyst AI and the bot compared their reads on a fresh signal."""
+    if verdict == "AGREE":
+        icon, head, tail = "🤝✅", "AI + BOT AGREE", "⚡ Fast lane: trading now"
+    else:
+        icon, head, tail = "🤝⛔", "AI ≠ BOT — the bot obeys the AI", "🚫 Entry blocked"
+    return (
+        f"{icon}  <b>{head}  ·  {symbol} {direction}</b>\n"
+        f"{_hr()}\n"
+        f"🧠 AI reads: <b>{bias}</b> ({confidence:.0%}, {state})\n"
+        f"💬 {html.escape(str(reason))}\n"
+        f"{tail}\n"
+    )
+
+
+def msg_scalp_close(kind, symbol, direction, ticket, code, detail, pnl):
+    """v2.3: a trade closed by the Scalp Guard (local rules) or the Analyst
+    (thesis flip). `kind` is 'guard' or 'analyst'."""
+    who = "SCALP GUARD" if kind == "guard" else "AI ANALYST FLIP"
+    icon = "🛡️" if kind == "guard" else "🤖🔄"
+    sign = "💰" if pnl >= 0 else "🩹"
+    return (
+        f"{icon}  <b>{who}  ·  {symbol} {direction}</b>\n"
+        f"{_hr()}\n"
+        f"🎫 Ticket: <code>{ticket}</code>\n"
+        f"🏷 Code: <code>{code}</code>\n"
+        f"💬 {html.escape(str(detail))}\n"
+        f"{sign} Closed at ~<b>{pnl:+.2f} USD</b>\n"
     )
 
 
