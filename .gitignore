@@ -25,3 +25,8 @@ SMC_Bot_Data/data/news_seen.json
 SMC_Bot_Data/data/ai_directives.json
 .env.bak
 SMC_Bot_Data/data/patterns.json
+
+# local run output and throw-away diagnostics (never commit)
+bot_forever_log.txt
+install_log.txt
+_mt5_diag*.py
