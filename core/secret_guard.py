@@ -47,6 +47,17 @@ ASSIGNMENT = re.compile(
     r"(?P<name>\b" + _SECRET_NAMES + r")\b[\"']?\s*(?:=|:|,)\s*"
     r"(?P<q>[\"']?)(?P<value>[^\s\"',)#]{4,})[\"']?")
 
+# lower-case / Python-style: `password="x"`, `mt5.login(1, password="x")`,
+# `for pw in ["x", "y"]`, `token = 'x'`. The upper-case pattern above never saw
+# these (it is case-sensitive on purpose), which is how a throw-away
+# `_mt5_diag.py` carrying a real password got past the hook. Here a QUOTED
+# literal is required, so `password = getpass()` / `token = tokens[0]` stay quiet.
+LOWER_ASSIGNMENT = re.compile(
+    r"(?i)\b(?P<name>(?:[a-z0-9_]*(?:password|passwd|passphrase|secret|api_?key|"
+    r"access_?key|token)[a-z0-9_]*)|pw|pwd|pass|pws|passwords?)\b[\"']?\s*"
+    r"(?:=|:|\bin\b)\s*[\[(]?\s*(?P<q>[\"'])(?P<value>[^\"'\s]{4,})[\"']"
+    r"(?P<more>(?:\s*,\s*[\"'][^\"'\s]*[\"'])*)")   # ["a", "b"]: every candidate
+
 # values that are clearly not real secrets
 PLACEHOLDER = re.compile(
     r"(?i)^(?:your[_-]?.*|<.*>|x{3,}|\*+|changeme|example.*|sk-key-\d+|"
@@ -101,6 +112,10 @@ def scan_text(text: str, source: str = "") -> list:
         if any(_is_real_assignment(line, m) for m in ASSIGNMENT.finditer(line)):
             findings.append((no, "secret_literal_assignment",
                              redact(line.strip())[:140]))
+        elif any(_looks_real(m.group("value"))
+                 for m in LOWER_ASSIGNMENT.finditer(line)):
+            findings.append((no, "secret_literal_assignment",
+                             redact(line.strip())[:140]))
     # de-duplicate (a line can match two patterns)
     seen, out = set(), []
     for f in findings:
@@ -137,7 +152,17 @@ def redact(text: str) -> str:
     def _assign(m):
         return m.group(0).replace(m.group("value"), MASK) \
             if _is_real_assignment(out, m) else m.group(0)
-    return ASSIGNMENT.sub(_assign, out)
+    out = ASSIGNMENT.sub(_assign, out)
+
+    # lower-case / keyword-argument literals: password="x" -> password="***"
+    def _assign_lower(m):
+        if not _looks_real(m.group("value")):
+            return m.group(0)
+        more = re.sub(r"([\"'])[^\"'\s]*\1", lambda q: q.group(1) + MASK + q.group(1),
+                      m.group("more"))
+        head = m.group(0)[:len(m.group(0)) - len(m.group("more"))]
+        return head.replace(m.group("value"), MASK) + more
+    return LOWER_ASSIGNMENT.sub(_assign_lower, out)
 
 
 class RedactingFilter(logging.Filter):

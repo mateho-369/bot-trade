@@ -91,6 +91,48 @@ class TestScan(unittest.TestCase):
                 self.assertNotIn(secret, excerpt)
 
 
+class TestLowercaseAndKeywordLiterals(unittest.TestCase):
+    """Regression: a throw-away `_mt5_diag.py` with password="<real>" in a call
+    (and a list of password guesses) was committed because the scanner only
+    knew UPPER_CASE names."""
+    PW2 = "Other9!" + "qq"
+
+    def hits(self, text):
+        return sg.scan_text(text)
+
+    def test_keyword_argument_in_a_call_is_caught(self):
+        self.assertTrue(self.hits(
+            f'lg = mt5.login(414408585, password="{FAKE_PW}", server="X-Trial")'))
+
+    def test_list_of_password_guesses_is_caught_and_every_one_is_masked(self):
+        hits = self.hits(f'for pw in ["{FAKE_PW}", "{self.PW2}"]:')
+        self.assertTrue(hits)
+        for _n, _k, excerpt in hits:
+            self.assertNotIn(FAKE_PW, excerpt)
+            self.assertNotIn(self.PW2, excerpt)
+
+    def test_lowercase_assignments_are_caught(self):
+        for line in (f'password = "{FAKE_PW}"', f"token = '{FAKE_PW}'",
+                     f'api_key="{FAKE_SK}"', f'client_secret: "{FAKE_PW}"'):
+            self.assertTrue(self.hits(line), line)
+
+    def test_code_references_and_prompts_stay_quiet(self):
+        for line in ("password = getpass.getpass()", "token = tokens[0]",
+                     "api_key = config.AI_API_KEYS[0]", 'token_type = "bearer"',
+                     'password_field = "password"', "def login(password, server):",
+                     'pw = os.environ["MT5_PASSWORD"]', "secret = None",
+                     'token = "your_token_here"', "password: str = \"\"",
+                     "for pw in passwords:", 'if pw in ["", "none"]:',
+                     "ok = mt5.login(login, password=password, server=server)",
+                     'parser.add_argument("--password", help="x")'):
+            self.assertEqual(self.hits(line), [], line)
+
+    def test_redact_masks_keyword_literals_for_logs_too(self):
+        out = sg.redact(f'login failed: mt5.login(1, password="{FAKE_PW}", server="S")')
+        self.assertNotIn(FAKE_PW, out)
+        self.assertIn('server="S"', out)
+
+
 class TestRedaction(unittest.TestCase):
     def test_generic_patterns_and_registered_values(self):
         sg.register_secret_values(FAKE_PW)
