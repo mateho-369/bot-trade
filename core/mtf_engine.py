@@ -32,6 +32,17 @@ TF_WEIGHT = {
 # M1 scalps lose to spread and noise (avg win +$0.06 vs losses), while the
 # winners came from M5/M15. The engine now scans M5 + M15 only.
 TIMEFRAMES = ["M5", "M15"]
+
+
+def active_timeframes():
+    """Timeframes the scan looks at. The scalper profile adds M1 (v2.3.2): with
+    only M5/M15 a scalper waits for a closed-bar M5/M15 setup, which on one gold
+    chart is a handful of signals a day - the AI Analyst could watch a clean M1
+    sell-off for 6 minutes and the bot still had nothing to act on. The cost
+    gates (spread vs stop, spread vs $ target) are what keep M1 honest."""
+    if getattr(config, "SCALP_SCAN_M1", False):
+        return ["M1"] + list(TIMEFRAMES)
+    return list(TIMEFRAMES)
 TF_ATR_MULT = {
     # SCALPING MODE (owner request 2026-10-07): tight targets for many
     # small wins. Was {"M1": 3.0, "M5": 3.5, "M15": 4.0} take-profit.
@@ -68,14 +79,14 @@ def h1_gate_ok(direction, h1_dir):
 
 def scan_all_timeframes(symbol, connector_func):
     """
-    Scans M1, M5, M15 for signals.
+    Scans the active timeframes (M5+M15, plus M1 for the scalper profile).
     Returns MTF decision dict.
 
     connector_func = get_candles function from mt5_connector
     """
     results = {}
 
-    for tf in TIMEFRAMES:
+    for tf in active_timeframes():
         try:
             # Need enough bars for EMA200 warmup
             count = 500 if tf == "M1" else 300
@@ -201,7 +212,7 @@ def _make_decision(symbol, results):
     # Prefer highest TF that agrees with direction
     chosen_tf   = None
     chosen_data = None
-    for tf in reversed(TIMEFRAMES):  # M15 → M5 → M1
+    for tf in reversed(active_timeframes()):  # M15 → M5 → M1
         data = results.get(tf)
         if data and data['signal'] and data['signal']['signal'] == direction:
             chosen_tf   = tf

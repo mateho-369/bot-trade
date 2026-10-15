@@ -178,6 +178,11 @@ def check_strategy(config):
             soft(f"BOT_PROFILE=scalper but ENTRY_ENGINE={config.ENTRY_ENGINE}: a value in "
                  f".env overrides the profile. {config.ENTRY_ENGINE} is not the fast M1 "
                  f"scalper - delete ENTRY_ENGINE from .env.")
+        if getattr(config, "SCALP_SCAN_M1", False):
+            say(INFO, "signals from M1 + M5 + M15 closed bars (SCALP_SCAN_M1)")
+        else:
+            soft("signals come from M5/M15 closed bars only: a handful a day on one "
+                 "chart - not a fast scalper. SCALP_SCAN_M1=true adds M1.")
         if getattr(config, "SCALP_USD_MODE", False):
             say(INFO, f"$ scalping · target ${config.SCALP_TARGET_USD:g}/trade · "
                       f"lot cap {config.SCALP_MAX_LOT:g} · skip when spread > "

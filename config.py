@@ -381,6 +381,9 @@ AI_BRIEF_FLIP_CONFIRMS    = _int_env("AI_BRIEF_FLIP_CONFIRMS", 2)
 # the TP distance (which still comes from the MARKET: ATR x TP_MULT) is worth
 # that many dollars; with TP_MULT == SL_MULT the loss at the stop is about the
 # same number. Wins and losses are the same small size, the win rate decides.
+# v2.3.2: also scan M1 for signals (scalper profile). Without it the engine only
+# reacts to closed M5/M15 bars - too slow for a scalper. false = M5/M15 only.
+SCALP_SCAN_M1             = _bool_env("SCALP_SCAN_M1", SCALPER)
 SCALP_USD_MODE            = _bool_env("SCALP_USD_MODE", SCALPER)
 SCALP_TARGET_USD          = _float_env("SCALP_TARGET_USD", 3.0)
 SCALP_MAX_LOT             = _float_env("SCALP_MAX_LOT", 1.0)

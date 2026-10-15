@@ -1014,5 +1014,55 @@ class TestPreflightScalperNotes(unittest.TestCase):
         self.assertIn("on silence: trade the bot's own signal", src)
 
 
+class TestScanM1(unittest.TestCase):
+    def _engine(self, scan_m1):
+        from core import mtf_engine
+        return mtf_engine, patch.object(mtf_engine.config, "SCALP_SCAN_M1", scan_m1,
+                                        create=True)
+
+    def test_timeframes_follow_the_switch(self):
+        eng, p = self._engine(True)
+        with p:
+            self.assertEqual(eng.active_timeframes(), ["M1", "M5", "M15"])
+        eng, p = self._engine(False)
+        with p:
+            self.assertEqual(eng.active_timeframes(), ["M5", "M15"])
+
+    def test_profile_defaults(self):
+        self.assertTrue(_load_config_copy("scalper").SCALP_SCAN_M1)
+        self.assertFalse(_load_config_copy("balanced").SCALP_SCAN_M1)
+        self.assertFalse(_load_config_copy("scalper", SCALP_SCAN_M1="false").SCALP_SCAN_M1)
+
+    def _results(self, m1_signal):
+        sig = {"signal": m1_signal, "rsi": 40.0, "pattern_score": 2, "atr": 1.0}
+        return {"M1": {"signal": sig, "df_feat": None, "weight": 1},
+                "M5": {"signal": None, "df_feat": None, "weight": 2},
+                "M15": {"signal": None, "df_feat": None, "weight": 3}}
+
+    def test_an_m1_only_signal_becomes_a_decision_when_m1_is_scanned(self):
+        eng, p = self._engine(True)
+        with p:
+            d = eng._make_decision("XAUUSD", self._results("SELL"))
+        self.assertIsNotNone(d)
+        self.assertEqual((d["direction"], d["chosen_tf"], d["n_positions"]),
+                         ("SELL", "M1", 1))
+
+    def test_the_scan_really_asks_the_connector_for_m1_bars(self):
+        eng, p = self._engine(True)
+        asked = []
+
+        def conn(sym, tf, count=0):
+            asked.append(tf)
+            return None
+        with p:
+            eng.scan_all_timeframes("XAUUSD", conn)
+        self.assertEqual(asked, ["M1", "M5", "M15"])
+        asked.clear()
+        eng, p = self._engine(False)
+        with p:
+            eng.scan_all_timeframes("XAUUSD", conn)
+        self.assertEqual(asked, ["M5", "M15"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
