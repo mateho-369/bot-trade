@@ -444,11 +444,15 @@ class TestBriefer(unittest.TestCase):
         df = _df(n=200)
         ctx = self.br.build_context("XAUUSD", df, h1_trend="BUY", spread_pct=0.01,
                                     news_titles=["a"] * 9,
-                                    bot=ab.bot_view(df, "BUY"),
-                                    performance={"recent_real_trades": {"n": 3}})
+                                    bot=ab.bot_view(df, "BUY"))
         self.assertEqual(len(ctx["bars_m1"]), self.br.n_bars)
         self.assertEqual(len(ctx["bars_m1"][0]), 4)
         self.assertEqual(ctx["bot_view"]["lean"], "BUY")
+        # owner rule: the Analyst reads the market, never the money
+        import inspect
+        self.assertNotIn("bot_recent_results", ctx)
+        self.assertNotIn("performance",
+                         inspect.signature(self.br.build_context).parameters)
         self.assertLessEqual(len(ctx["recent_news"]), 5)
         self.assertLess(len(json.dumps(ctx)), 4000, "keep the prompt small and fast")
         blob = json.dumps(ctx).lower()
@@ -627,7 +631,6 @@ class FlowCase(unittest.TestCase):
             patch.object(main, "_get_cur_bar",
                          side_effect=lambda *a, **k: self.bar["v"]),
             patch.object(main, "get_candles", return_value=None),
-            patch.object(main, "recent_performance", return_value={}),
             patch("core.risk_manager.positions_allowed", return_value=3),
             patch("core.risk_manager.calc_lot_size", return_value=0.01),
             patch("core.risk_manager.can_open_new_trade", return_value=(True, "")),
@@ -968,6 +971,68 @@ class TestGuardianBriefing(FlowCase):
         self.assertGreaterEqual(sm["seconds_open"], 39)
         self.assertEqual(sm["analyst_brief"]["bias"], "BUY")
         self.assertIn("bank_at_usd", sm["scalp_guard_will"])
+
+    def _guardian_review(self, feature_cache):
+        config.SCALP_GUARD_ENABLED = True
+        r = MagicMock()
+        r.due.return_value = True
+        r.build_context.return_value = {"floating_usd": 1.1}
+        r.review.return_value = MagicMock(action="HOLD", approved=False,
+                                          confidence=0.5, model="fake",
+                                          key_number=1, reason_code="T")
+        main.ai_position_reviewer = r
+        state = main.state_for("XAUUSD")
+        state["feature_cache"] = feature_cache
+        state["positions"].append({"ticket": 6002, "direction": 1,
+                                   "opened_ts": time.time() - 30,
+                                   "target_usd": 3.0, "sl_usd": 3.0})
+        pos = MagicMock(type=0, tp=2002.0, price_open=2000.0, price_current=2000.5,
+                        sl=1999.0, profit=1.1, time=time.time() - 30)
+        with patch.object(main, "get_position_by_ticket", return_value=pos):
+            main.submit_position_reviews("XAUUSD", state)
+        return r.review.call_args[0][0]
+
+    def test_guardian_sees_the_candles_the_dollars_and_the_analyst(self):
+        _accepted(self.briefer, bias="BUY", conf=0.7)
+        ctx = self._guardian_review(_df(n=60))
+        # candles (market) ...
+        chart = ctx["market_chart"]
+        self.assertEqual(len(chart["bars_m1"]), 12)
+        self.assertEqual(len(chart["bars_m1"][0]), 4)
+        for k in ("atr", "rsi", "ema20_slope_atr", "dist_to_20bar_high_atr",
+                  "dist_to_20bar_low_atr", "atr_vs_50bar_avg"):
+            self.assertIn(k, chart["indicators"])
+        # ... the money ...
+        self.assertEqual(ctx["floating_usd"], 1.1)
+        self.assertEqual(ctx["scalp_mode"]["target_usd"], 3.0)
+        # ... and the Analyst's read, all in one snapshot
+        self.assertEqual(ctx["scalp_mode"]["analyst_brief"]["bias"], "BUY")
+        # still no results-feedback
+        for k in ("recent_performance", "ai_lessons", "account"):
+            self.assertNotIn(k, ctx)
+
+    def test_guardian_still_reviews_when_there_is_no_chart_yet(self):
+        ctx = self._guardian_review(None)
+        self.assertNotIn("market_chart", ctx)
+        self.assertEqual(ctx["floating_usd"], 1.1)
+
+    def test_guardian_and_analyst_read_the_same_chart(self):
+        df = _df(n=200)
+        view = ab.chart_view(df, self.briefer.n_bars)
+        ctx = self.briefer.build_context("XAUUSD", df, h1_trend="BUY")
+        self.assertEqual(ctx["bars_m1"], view["bars_m1"])
+        self.assertEqual(ctx["indicators"], view["indicators"])
+
+    def test_chart_view_never_raises(self):
+        for bad in (None, _df(n=3), "nope"):
+            self.assertEqual(ab.chart_view(bad)["bars_m1"], [])
+
+    def test_the_position_prompt_explains_go_bigger_and_bank(self):
+        from core import ai_position
+        text = ai_position.SYSTEM_POLICY
+        for needle in ("market_chart", "bars_m1", "floating_usd",
+                       "go bigger", "close fast", "EXTEND", "CLOSE"):
+            self.assertIn(needle, text)
 
 
 class TestPreflightScalperNotes(unittest.TestCase):

@@ -782,8 +782,11 @@ class TestContextTruth(unittest.TestCase):
         r = AIReviewer(MagicMock())
         ctx = r.build_context("XAUUSD", _decision(), _decision()["signal"], 2.0,
                               "H1", open_positions=0, spread_pct=0.02)
-        for key in ("management_contract", "ai_lessons", "bot_directives", "cost"):
+        for key in ("management_contract", "bot_directives", "cost"):
             self.assertIn(key, ctx)
+        # owner rule: results / lessons are no longer fed back into the gate
+        for key in ("ai_lessons", "recent_performance"):
+            self.assertNotIn(key, ctx)
         # SR_H1's sl_atr is an ATR VALUE — it must not be forwarded as a distance
         self.assertAlmostEqual(ctx["proposed"]["sl_distance_atr"], 0.5, places=2)
 
@@ -793,11 +796,9 @@ class TestContextTruth(unittest.TestCase):
         self.assertIsNone(spread_cost_pct(0.02, 0.0, 2000.0))
         self.assertIsNone(spread_cost_pct(0.02, 4.0, 0.0))
 
-    def test_performance_briefing_is_honest(self):
-        perf = main.recent_performance()
-        self.assertIsInstance(perf, dict)
-        self.assertNotIn("last_20_real_trades", perf,
-                         "v2.0 labelled a 5-trade window as 'last_20'")
+    def test_no_results_briefing_helper_is_left_to_re_wire(self):
+        # the old helper that briefed the AIs with win rate / net result is gone
+        self.assertFalse(hasattr(main, "recent_performance"))
 
 
 class TestCostGate(FlowCase):
@@ -1000,6 +1001,130 @@ class TestLoopNeverBlocks(FlowCase):
             time.sleep(0.02)
         self.assertEqual(main.place_buy.call_count, 1)
         self.assertEqual(main.state_for("XAUUSD")['pending_ai'], {})
+
+
+# ══════════════════════════════════════════════════════════
+#   owner rule: the AI adapts to the MARKET, never to money
+# ══════════════════════════════════════════════════════════
+class TestMarketOnlyAI(unittest.TestCase):
+    MONEY_KEYS = ("recent_performance", "ai_lessons", "account",
+                  "bot_recent_results")
+    BANNED_WORDS = ("win rate", "winrate", "losing streak", "drawdown",
+                    "balance", "equity", "recent_performance", "ai_lessons")
+
+    def setUp(self):
+        self._cfg = {k: getattr(config, k) for k in
+                     ("AI_PROVIDER", "AI_API_KEYS", "AI_REGIME_ENABLED")}
+        self._main = {k: getattr(main, k) for k in
+                      ("ai_regime", "ai_bus", "news_watcher")}
+        config.AI_PROVIDER = "openai_compat"
+        config.AI_API_KEYS = ["k"]
+        config.AI_REGIME_ENABLED = True
+
+    def tearDown(self):
+        for k, v in self._cfg.items():
+            setattr(config, k, v)
+        for k, v in self._main.items():
+            setattr(main, k, v)
+
+    # -- regime ---------------------------------------------------
+    def test_regime_snapshot_is_market_only(self):
+        ctx = RegimeReviewer(journal=MagicMock()).build_context(
+            {"XAUUSD": {"atr_pct": 0.1, "last_close": 2000.0,
+                        "spread_pct": 0.02}}, ["a headline"])
+        self.assertEqual(set(ctx), {
+            "utc_hour", "symbols", "recent_news", "current_settings",
+            "owner_baseline", "allowed_ranges", "your_last_directive"})
+        for k in self.MONEY_KEYS + ("management_contract",):
+            self.assertNotIn(k, ctx)
+        blob = json.dumps(ctx).lower()
+        for needle in ("balance", "equity", "winrate", "net_usd", "losses"):
+            self.assertNotIn(needle, blob)
+
+    def test_regime_message_sent_to_the_provider_has_no_money_words(self):
+        r = RegimeReviewer(journal=MagicMock())
+        sent = {}
+
+        class _Client:
+            name, model, last_key_number = "openai_compat", "m", 1
+
+            def complete(self, messages, schema):
+                sent["all"] = " ".join(m["content"] for m in messages).lower()
+                return ('{"market_regime":"calm","summary":"s","changes":[]}',
+                        "m", "openai_compat")
+        r._client = _Client()
+        _ctx, decision, *_rest = r.evaluate(
+            {"XAUUSD": {"atr_pct": 0.1, "last_close": 2000.0}}, [])
+        self.assertIsNotNone(decision)
+        for w in self.BANNED_WORDS:
+            self.assertNotIn(w, sent["all"])
+        from core import ai_regime
+        self.assertIn("adapt to the market only", ai_regime.SYSTEM_POLICY)
+
+    def _run_review(self, spread_kw):
+        reg = MagicMock()
+        reg.run.return_value = ("calm", "ok", [])
+        main.ai_regime, main.ai_bus, main.news_watcher = reg, None, None
+        n = 120
+        base = [2000.0 + i * 0.1 for i in range(n)]
+        h1 = pd.DataFrame({"open": base, "high": [b + 1.0 for b in base],
+                           "low": [b - 1.0 for b in base], "close": base})
+        with patch.object(main, "get_candles", return_value=h1), \
+                patch.object(main, "get_spread_percent", **spread_kw):
+            main.run_ai_regime_review()
+        return reg.run.call_args[0][0]          # the symbols_stats it was given
+
+    def test_spread_pct_is_in_the_regime_snapshot_when_available(self):
+        stats = self._run_review({"return_value": 0.0213})
+        self.assertAlmostEqual(stats["XAUUSD"]["spread_pct"], 0.0213)
+        self.assertIn("atr_pct", stats["XAUUSD"])
+        self.assertIn("last_close", stats["XAUUSD"])
+
+    def test_spread_pct_is_simply_omitted_when_the_helper_raises(self):
+        stats = self._run_review({"side_effect": RuntimeError("no tick")})
+        self.assertIn("XAUUSD", stats)
+        self.assertNotIn("spread_pct", stats["XAUUSD"])
+        self.assertIn("atr_pct", stats["XAUUSD"])
+
+    # -- entry gate / guardian ------------------------------------
+    def test_entry_gate_snapshot_has_no_results_fields(self):
+        from core.ai_review import AIReviewer
+        ctx = AIReviewer(MagicMock()).build_context(
+            "XAUUSD", _decision(), _decision()["signal"], 2.0, "H1",
+            open_positions=0, spread_pct=0.02)
+        for k in self.MONEY_KEYS:
+            self.assertNotIn(k, ctx)
+        for k in ("management_contract", "cost", "market_structure",
+                  "proposed", "market"):
+            self.assertIn(k, ctx)
+        self.assertEqual(ctx["market"]["spread_pct"], 0.02)
+
+    def test_guardian_snapshot_has_no_results_fields_but_keeps_the_target(self):
+        from core.ai_position import PositionReviewer
+        ctx = PositionReviewer(MagicMock()).build_context(
+            symbol="XAUUSD", direction=1, entry=2000.0, current_price=2001.0,
+            sl=1998.0, tp=2004.0, floating_usd=1.2, progress=0.25,
+            minutes_open=1.5, atr=2.0, rsi=55.0, spread_pct=0.02,
+            open_positions=1, max_positions=1)
+        for k in self.MONEY_KEYS:
+            self.assertNotIn(k, ctx)
+        for k in ("floating_usd", "progress_to_tp", "management_contract"):
+            self.assertIn(k, ctx)
+
+    def test_main_does_not_wire_results_into_any_ai_role(self):
+        import inspect
+        src = inspect.getsource(main)
+        for needle in ("recent_performance", "ai_lessons", "bot_recent_results"):
+            self.assertNotIn(needle, src)
+
+    # -- all four policies ----------------------------------------
+    def test_all_four_policies_are_market_only(self):
+        from core import ai_regime, ai_brief, ai_review, ai_position
+        for name, mod in (("regime", ai_regime), ("analyst", ai_brief),
+                          ("entry gate", ai_review), ("guardian", ai_position)):
+            text = (mod.SYSTEM_POLICY + mod._USER_TEMPLATE).lower()
+            for w in self.BANNED_WORDS:
+                self.assertNotIn(w, text, f"{name} policy still says '{w}'")
 
 
 if __name__ == "__main__":

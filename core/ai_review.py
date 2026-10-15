@@ -25,9 +25,10 @@
 #   treated as untrusted DATA, never as instructions.
 #
 #   v2.1 (flow repair):
-#     • the snapshot now carries management_contract() + ai_lessons() — the
-#       live protection levels and the track record of the AI's own past
-#       verdicts, instead of stale numbers hardcoded in the prompt;
+#     • the snapshot carries management_contract() — the live protection
+#       levels, instead of stale numbers hardcoded in the prompt. (Owner
+#       rule: the gate decides from the MARKET; past results/lessons are no
+#       longer fed back into it.)
 #     • provider replies are read defensively (getattr) so a duck-typed or
 #       older client cannot raise inside the review path;
 #     • review() stays synchronous for callers that can afford it, and
@@ -83,11 +84,12 @@ SYSTEM_POLICY = (
     "WAIT). REJECT if spread eats > 20% of the target distance.\n"
     "5. TIMING — REJECT around major scheduled releases within ~30 minutes "
     "or live shocks; age-tagged stale headlines are context only.\n"
-    "6. CALIBRATION (EVIDENCE, NOT VIBES) — recent_performance and "
-    "ai_lessons show live results: your own approve win rate, the win rate "
-    "per reason_code and per symbol, and the spread cost as a share of the "
-    "stop. After a losing streak, or on a symbol whose win rate is < 40%, "
-    "raise your bar (WAIT on borderline setups). In a clean trend with "
+    "6. CALIBRATION (MARKET EVIDENCE, NOT VIBES) — judge only what the "
+    "snapshot shows about the market: volatility (atr_vs_avg), the spread "
+    "cost as a share of the stop (cost.spread_pct_of_stop), swing structure "
+    "and momentum. When spread cost is near the cap, or volatility is "
+    "exploding or dead, raise your bar (WAIT on borderline setups). In a "
+    "clean trend with "
     "pattern_score >= 2 and spread cost under the cap, APPROVE confidently "
     "(the position manager can extend winners). Judge cost, not just shape: "
     "a setup that pays less than its spread cost is a REJECT whatever the "
@@ -126,10 +128,7 @@ _USER_TEMPLATE = (
     "eats. Compare it with management_contract.max_spread_pct_of_stop — "
     "above the cap means the bot blocks it anyway.\n"
     "• management_contract: the REAL rules protecting this trade, and the "
-    "only levers you have. Quote nothing you cannot see there.\n"
-    "• ai_lessons: measured results of past decisions (bot + your own). "
-    "It is history, not a prediction — use it to set your bar, not to gamble "
-    "the next one after a loss streak.\n\n"
+    "only levers you have. Quote nothing you cannot see there.\n\n"
     "This bot scalps: reward:risk 1.0-1.5 is BY DESIGN and every approved "
     "trade is actively managed afterwards — judge only whether the entry is "
     "clearly bad right now.\n"
@@ -343,8 +342,6 @@ class AIReviewer:
             },
             # ── v2.1: the two halves of the conversation ──
             "management_contract": ai_context.management_contract(),
-            "ai_lessons": dict(bot=ai_context.bot_results(),
-                               me=ai_context.ai_track_record()),
             "bot_directives": ai_context.directives_state(),
         }
 

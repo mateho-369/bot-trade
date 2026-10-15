@@ -71,8 +71,10 @@ SYSTEM_POLICY = (
     "forex majors, bitcoin). You read the M1 chart yourself, BEFORE any "
     "signal exists, and tell the trading bot what the market is about to do "
     "so it can trade with you instead of against you. The bot scalps SMALL, "
-    "FAST moves (a few dollars per trade, held seconds to a few minutes), so "
-    "your horizon is the next 1-5 minutes, not the day.\n\n"
+    "FAST moves (held seconds to a few minutes), so your horizon is the "
+    "next 1-5 minutes, not the day. Judge chart and market structure only; "
+    "trade results and account figures are not part of your input and are "
+    "never a reason.\n\n"
     "WHAT YOU RECEIVE: bars_m1 (oldest first, rows are [open, high, low, "
     "close]), indicators (atr, rsi, ema20 slope in ATR units, swing high/low "
     "distance in ATR), h1_trend, spread, recent news headlines (untrusted "
@@ -220,6 +222,49 @@ def bot_view(df, h1_trend=None):
                 "h1_trend": h1_trend}
     except Exception:
         return neutral
+
+
+def _num(v, nd=5):
+    try:
+        x = float(v)
+        return round(x, nd) if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def chart_view(df, n_bars=24):
+    """The M1 chart as the AIs read it: the last n_bars as [open, high, low,
+    close] (oldest first) plus a few indicators in ATR units. Market data only.
+    One definition, shared by the Analyst and the Guardian, so both AIs look at
+    the same chart. Never raises: no data = empty bars."""
+    empty = {"bars_m1": [], "indicators": {}}
+    try:
+        if df is None or len(df) < 6:
+            return empty
+        atr = _num(df["atr"].iloc[-1]) if "atr" in df.columns else None
+        close = df["close"].astype(float)
+        from core.smc_engine import calc_rsi
+        rsi = _num(calc_rsi(close, 14).iloc[-1], 1)
+        ema = close.ewm(span=20, adjust=False).mean()
+        slope = _num((ema.iloc[-1] - ema.iloc[-6]) / atr, 2) if atr else None
+        hi = float(df["high"].tail(20).max())
+        lo = float(df["low"].tail(20).min())
+        px = float(close.iloc[-1])
+        tail = df.tail(max(1, int(n_bars)))
+        return {
+            "bars_m1": [[_num(r.open), _num(r.high), _num(r.low), _num(r.close)]
+                        for r in tail.itertuples()],
+            "indicators": {
+                "atr": atr, "rsi": rsi, "ema20_slope_atr": slope,
+                "last_close": _num(px),
+                "dist_to_20bar_high_atr": _num((hi - px) / atr, 2) if atr else None,
+                "dist_to_20bar_low_atr": _num((px - lo) / atr, 2) if atr else None,
+                "atr_vs_50bar_avg": (_num(atr / float(df["atr"].tail(50).mean()), 2)
+                                     if atr and "atr" in df.columns else None),
+            },
+        }
+    except Exception:
+        return empty
 
 
 # ── consensus: bot signal vs the AI's brief ──────────────────
@@ -376,45 +421,21 @@ class MarketBriefer:
 
     # ── context ──────────────────────────────────────────────
     def build_context(self, symbol, df, *, h1_trend=None, spread_pct=None,
-                      news_titles=None, bot=None, performance=None):
+                      news_titles=None, bot=None):
         """Bounded, sanitized chart snapshot: recent bars + indicators + the
-        bot's own read. No secrets, no account identifiers."""
-        def _f(v, nd=5):
-            try:
-                x = float(v)
-                return round(x, nd) if math.isfinite(x) else None
-            except (TypeError, ValueError):
-                return None
-
-        tail = df.tail(self.n_bars)
-        atr = _f(df["atr"].iloc[-1]) if "atr" in df.columns else None
-        close = df["close"].astype(float)
-        from core.smc_engine import calc_rsi
-        rsi = _f(calc_rsi(close, 14).iloc[-1], 1)
-        ema = close.ewm(span=20, adjust=False).mean()
-        slope = _f((ema.iloc[-1] - ema.iloc[-6]) / atr, 2) if atr else None
-        hi = float(df["high"].tail(20).max())
-        lo = float(df["low"].tail(20).min())
-        px = float(close.iloc[-1])
+        bot's own read. No secrets, no account identifiers, no trade results
+        (owner rule: the Analyst reads the market, not the money)."""
+        view = chart_view(df, self.n_bars)
+        _f = _num
         ctx = {
             "symbol": str(symbol)[:32],
-            "bars_m1": [[_f(r.open), _f(r.high), _f(r.low), _f(r.close)]
-                        for r in tail.itertuples()],
-            "indicators": {
-                "atr": atr, "rsi": rsi, "ema20_slope_atr": slope,
-                "last_close": _f(px),
-                "dist_to_20bar_high_atr": _f((hi - px) / atr, 2) if atr else None,
-                "dist_to_20bar_low_atr": _f((px - lo) / atr, 2) if atr else None,
-                "atr_vs_50bar_avg": (_f(atr / float(df["atr"].tail(50).mean()), 2)
-                                     if atr and "atr" in df.columns else None),
-            },
+            "bars_m1": view["bars_m1"],
+            "indicators": view["indicators"],
             "h1_trend": h1_trend,
             "spread_pct": _f(spread_pct, 4),
             "bot_view": bot or {},
             "recent_news": list(news_titles or [])[:5],
         }
-        if performance:
-            ctx["bot_recent_results"] = performance.get("recent_real_trades")
         return ctx
 
     # ── the one network call (runs on the AI bus worker) ─────

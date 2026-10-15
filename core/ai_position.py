@@ -64,9 +64,15 @@ SYSTEM_POLICY = (
     "reviewing ONE open position of an automated scalping bot (gold, forex "
     "majors, bitcoin). Think like an elite trader: protect open profit, cut "
     "stalled trades early, let true runners run.\n"
-    "SNAPSHOT FACTS: entry, current_price, floating_usd, progress_to_tp "
-    "(1.0 = at target), minutes_open, ATR, RSI, spread, recent_news, "
-    "recent_performance, ai_lessons and management_contract. The contract "
+    "SNAPSHOT FACTS: entry, current_price, floating_usd (the open profit or "
+    "loss in dollars), progress_to_tp (1.0 = at target), minutes_open, ATR, "
+    "RSI, spread, recent_news, market_chart and management_contract. "
+    "market_chart is the live M1 chart: bars_m1 = the last bars as [open, "
+    "high, low, close], oldest first, the LAST bar still forming; indicators "
+    "= atr, rsi, ema20_slope_atr, dist_to_20bar_high_atr / "
+    "dist_to_20bar_low_atr and atr_vs_50bar_avg (>1.8 = news chaos). Read the "
+    "candles together with the dollars: price action decides the direction "
+    "of your call, floating_usd decides how much it is worth. The contract "
     "states the protection levels that are REALLY in force right now "
     "(break-even progress, trailing stages and ATR multiples, TP scale, "
     "your review cadence, your extend rule). Assume nothing else — the bot "
@@ -78,18 +84,25 @@ SYSTEM_POLICY = (
     "- EARLY CUT: if the trade fights strong opposing momentum shortly "
     "after entry and the distance to the stop is already most of the day's "
     "risk, CLOSE to save the loss before the stop is hit.\n"
-    "- RUNNER: EXTEND only when extend_allowed is true (progress at or "
-    "above management_contract.extend_rule.min_progress) AND momentum still "
-    "pushes AND that position has not been extended before; otherwise HOLD. "
-    "A second EXTEND does not exist — you get one per position.\n"
+    "- RUNNER (go bigger): EXTEND only when extend_allowed is true (progress "
+    "at or above management_contract.extend_rule.min_progress) AND the last "
+    "bars still push the trade's way with real bodies and no long wick "
+    "against it AND price is not pressing into the 20-bar high/low it must "
+    "break (dist_to_20bar_*_atr) AND that position has not been extended "
+    "before; otherwise HOLD. A second EXTEND does not exist — you get one "
+    "per position.\n"
+    "- BANK (close fast): with floating_usd above zero, CLOSE when the bars "
+    "show the push is over — a stall of small bodies, a long wick against "
+    "the trade, a close back through the 20-bar level, ema20_slope_atr "
+    "turning against it, or atr_vs_50bar_avg exploding. Take the profit "
+    "while it is there; do not wait for the guard's timers.\n"
     "- DO NOT double the bot: CLOSE is worthless when the trailing stop is "
     "already tighter than your suggestion (compare sl_price with "
     "current_price and the contract), and EXTEND is worthless when the bot "
     "is about to take profit anyway. Say HOLD and explain.\n"
-    "- CALIBRATION: recent_performance + ai_lessons are measured results — "
-    "after losses bank earlier, in clean trends hold longer. If your own "
-    "CLOSE history shows you banked winners that then ran, be stricter "
-    "about CLOSE.\n"
+    "- CALIBRATION: judge from the market in front of you — in a clean "
+    "trend with momentum intact hold longer; when momentum fades or the "
+    "spread widens, bank earlier.\n"
     "- SCALP MODE: when the snapshot has scalp_mode, this is a $-target "
     "scalp (target_usd, stop_usd, peak_usd, seconds_open). A deterministic "
     "Scalp Guard ALREADY banks the target, cuts stalls, gives-back and "
@@ -278,10 +291,9 @@ class PositionReviewer:
             },
             "extend_allowed": bool(
                 progress >= float(getattr(config, "AI_EXTEND_MIN_PROGRESS", 0.9))),
-            # ── v2.1: what the bot will really do, and the record so far ──
+            # ── v2.1: what the bot will really do (owner rule: no past
+            #    results / lessons are fed back - the market decides) ──
             "management_contract": ai_context.management_contract(),
-            "ai_lessons": dict(bot=ai_context.bot_results(),
-                               me=ai_context.ai_track_record()),
             "bot_directives": ai_context.directives_state(),
         }
 

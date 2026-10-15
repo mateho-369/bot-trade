@@ -44,7 +44,7 @@ from core.ai_position    import PositionReviewer
 from core.ai_regime      import RegimeReviewer
 from core.ai_bus         import AIBus
 from core.ai_brief       import (MarketBriefer, FlipTracker, bot_view, consensus,
-                                 AGREE, CONFLICT, NEUTRAL, NO_BRIEF)
+                                 chart_view, AGREE, CONFLICT, NEUTRAL, NO_BRIEF)
 from core                import scalp_guard
 from core                import ai_context
 from core.news           import NewsWatcher
@@ -364,7 +364,13 @@ def submit_position_reviews(symbol, state):
             max_positions=config.MAX_POSITIONS)
         if news_watcher is not None:
             ctx["recent_news"] = news_watcher.recent_titles(5)
-        ctx["recent_performance"] = recent_performance()
+        # The Guardian reads the same M1 chart as the Analyst (market only), so
+        # "bank it" and "go bigger" are judged on the candles AND on the dollars
+        # (floating_usd / scalp_mode below). atr/rsi above are H1; this is M1.
+        _chart = chart_view(state.get('feature_cache'),
+                            int(getattr(config, 'AI_POSITION_CHART_BARS', 12)))
+        if _chart["bars_m1"]:
+            ctx["market_chart"] = _chart
         if (getattr(config, 'SCALP_GUARD_ENABLED', False)
                 or getattr(config, 'SCALP_USD_MODE', False)):
             # The Guardian is briefed in scalper terms: dollars, seconds, and
@@ -569,44 +575,10 @@ def apply_position_verdicts():
 
 
 
-# ── AI ⇄ bot briefing: the AI's memory of live results ──────────
-# LLMs are stateless between calls, so every decision gets a compact summary
-# of how recent REAL trades and the AI's own past verdicts turned out. v2.1:
-# the computation lives in core/ai_context.py so the entry gate, the position
-# manager and the directive review all see the SAME evidence (and the numbers
-# are labelled honestly — v2.0 called a 5-trade window "last_20_real_trades").
-def recent_performance():
-    """Bot results + the AI's own track record, bounded and cached."""
-    out = {}
-    bot = ai_context.bot_results()
-    if bot:
-        out["recent_real_trades"] = {
-            "n": bot.get("trades", 0), "wins": bot.get("wins", 0),
-            "losses": bot.get("losses", 0),
-            "winrate_pct": bot.get("winrate_pct"),
-            "net_usd": bot.get("net_usd"),
-            "sequence": bot.get("sequence"),
-            "spread_pct_of_stop_avg": bot.get("spread_pct_of_stop_avg"),
-            "per_symbol": bot.get("per_symbol"),
-        }
-    me = ai_context.ai_track_record()
-    if me:
-        out["ai_history"] = me
-    try:
-        df = trade_logger.load()
-        stats = trade_logger.get_stats()
-        out["bot_stats"] = {"total": stats.get("total", 0),
-                            "winrate_pct": round(stats.get("winrate", 0.0), 1),
-                            "loss_streak": int(globals().get("consec_losses", 0))}
-    except Exception:
-        pass
-    if getattr(config, "ML_ENABLED", False):
-        try:
-            out["ml_gate"] = {"min_confidence": config.ML_MIN_CONFIDENCE,
-                              "trained": bool(ml_model.trained)}
-        except Exception:
-            pass
-    return out
+# NOTE (owner rule: "adapt to the market, not to money"): the AI roles are no
+# longer briefed with the bot's results or its own track record. The old
+# results-briefing helper was removed on purpose; trade profit/outcome is
+# still journaled to ai_decisions.csv / trade_log.csv for the owner to review.
 
 
 # ═════════════════════════════════════════════════════════════
@@ -650,7 +622,7 @@ def submit_brief_refreshes(symbol, state):
         titles = news_watcher.recent_titles(5) if news_watcher is not None else []
         ctx = ai_briefer.build_context(
             symbol, df, h1_trend=h1, spread_pct=spread, news_titles=titles,
-            bot=bot_view(df, h1), performance=recent_performance())
+            bot=bot_view(df, h1))
         meta = {'symbol': symbol, 'price': float(df['close'].iloc[-1]),
                 'atr': float(df['atr'].iloc[-1]), 'bar': cur_bar}
     except Exception as e:
@@ -868,20 +840,22 @@ def run_ai_regime_review():
             atr = float(calc_atr(h1, 14).iloc[-1])
             close = float(h1['close'].iloc[-1])
             if close > 0 and atr == atr and atr > 0:
-                symbols_stats[sym] = {"atr_pct": round(atr / close * 100, 3),
-                                      "last_close": round(close, 5)}
+                stats = {"atr_pct": round(atr / close * 100, 3),
+                         "last_close": round(close, 5)}
+                try:   # market data only; simply omitted if the broker will not say
+                    stats["spread_pct"] = round(float(get_spread_percent(sym)), 4)
+                except Exception:
+                    pass
+                symbols_stats[sym] = stats
         except Exception:
             continue
-    acc = get_account_info()
     news = news_watcher.recent_titles(5) if news_watcher else []
-    perf = recent_performance()
     ai_regime.mark_run()          # cadence starts now, not when the answer lands
     if ai_bus is None:             # sync fallback (tests / AI_ASYNC=false)
-        report_regime(ai_regime.run(symbols_stats, acc, news, perf=perf))
+        report_regime(ai_regime.run(symbols_stats, news))
         return
     if not ai_bus.submit('regime', 'review',
-                         lambda: ai_regime.evaluate(symbols_stats, acc, news,
-                                                     perf=perf)):
+                         lambda: ai_regime.evaluate(symbols_stats, news)):
         event("AI directive review skipped — queue busy; keeping current settings")
 
 
@@ -1351,7 +1325,6 @@ def build_ai_snapshot(symbol, decision, state):
         spread_pct=spread_pct)
     if news_watcher is not None:
         ctx["recent_news"] = news_watcher.recent_titles(5)
-    ctx["recent_performance"] = recent_performance()
     if decision.get('ai_brief'):
         # the Analyst's earlier, independent read: the gate sees it too, so the
         # two AI opinions are consistent instead of two strangers
