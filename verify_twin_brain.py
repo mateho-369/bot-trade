@@ -25,6 +25,7 @@
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -42,6 +43,7 @@ import pandas as pd                # noqa: E402
 ROOT = os.path.dirname(os.path.abspath(__file__))
 _TMP = tempfile.mkdtemp(prefix="bot_twin_test_")
 
+import _isolate_env                # noqa: F401,E402  (never read the real .env)
 import config                        # noqa: E402
 config.DATA_ROOT_PATH = _TMP
 config.MODEL_PATH = f"{_TMP}/models/smc_model.pkl"
@@ -997,16 +999,31 @@ class TestPreflightScalperNotes(unittest.TestCase):
         out = self._run("check_ai", AI_ENTRY_MAX_AGE_SECONDS="1.0")
         self.assertIn("much tighter", out)
 
-    def test_small_account_gets_a_dollar_risk_warning(self):
+    def test_small_account_is_told_it_runs_one_position(self):
         out = self._run("check_strategy", balance=32.27)
-        self.assertIn("$ risk", out)
-        self.assertIn("~28% of the $32.27 balance", out)
+        self.assertIn("only 1 position at a time", out)
+        self.assertIn("~9% of the $32.27 balance", out)
+        self.assertNotIn("stop-outs end the day", out)
+
+    def test_risky_dollar_target_on_a_mid_account_gets_a_warning(self):
+        out = self._run("check_strategy", balance=60.0, SCALP_TARGET_USD="10")
+        self.assertIn("~50% of the $60.00 balance", out)
         self.assertIn("stop-outs end the day", out)
 
     def test_big_account_gets_the_info_line_but_no_warning(self):
         out = self._run("check_strategy", balance=5000.0)
         self.assertIn("% of the $5,000.00 balance", out)
         self.assertNotIn("stop-outs end the day", out)
+
+    def test_brief_ttl_shorter_than_the_interval_is_flagged(self):
+        out = self._run("check_strategy", AI_BRIEF_INTERVAL_SECONDS="120",
+                        AI_BRIEF_TTL_SECONDS="90")
+        self.assertIn("would be stale before the next one arrives", out)
+        ok = self._run("check_strategy", AI_BRIEF_INTERVAL_SECONDS="120",
+                       AI_BRIEF_TTL_SECONDS="150")
+        self.assertNotIn("would be stale", ok)
+        default = self._run("check_strategy")
+        self.assertNotIn("would be stale", default)
 
     def test_entry_gate_log_line_matches_the_policy(self):
         import inspect
@@ -1062,6 +1079,194 @@ class TestScanM1(unittest.TestCase):
         with p:
             eng.scan_all_timeframes("XAUUSD", conn)
         self.assertEqual(asked, ["M5", "M15"])
+
+
+class TestAnalystOwnProvider(unittest.TestCase):
+    def test_shares_the_main_endpoint_by_default(self):
+        cfg = _load_config_copy("scalper", AI_PROVIDER="openai_compat",
+                                AI_BASE_URL="https://main.example/v1", AI_API_KEYS="k1,k2")  # secret-scan: allow
+        self.assertEqual(cfg.ai_brief_endpoint(), ("https://main.example/v1", ["k1", "k2"]))
+        self.assertTrue(cfg.ai_brief_on())
+
+    def test_own_endpoint_needs_both_url_and_keys(self):
+        base = dict(AI_PROVIDER="openai_compat", AI_BASE_URL="https://main.example/v1",
+                    AI_API_KEYS="k1")
+        both = _load_config_copy("scalper", **base, AI_BRIEF_BASE_URL="https://b.example/v1",
+                                 AI_BRIEF_API_KEYS="b1, b2")
+        self.assertEqual(both.ai_brief_endpoint(), ("https://b.example/v1", ["b1", "b2"]))
+        only_url = _load_config_copy("scalper", **base, AI_BRIEF_BASE_URL="https://b.example/v1")
+        self.assertEqual(only_url.ai_brief_endpoint()[0], "https://main.example/v1")
+
+    def test_analyst_can_run_when_only_its_own_keys_exist(self):
+        cfg = _load_config_copy("scalper", AI_PROVIDER="openai_compat",
+                                AI_BRIEF_BASE_URL="https://b.example/v1",
+                                AI_BRIEF_API_KEYS="b1")
+        self.assertTrue(cfg.ai_brief_on())
+        off = _load_config_copy("scalper", AI_PROVIDER="disabled",
+                                AI_BRIEF_BASE_URL="https://b.example/v1",
+                                AI_BRIEF_API_KEYS="b1")
+        self.assertFalse(off.ai_brief_on())
+
+    def test_the_briefer_client_uses_that_endpoint(self):
+        cfg = _load_config_copy("scalper", AI_PROVIDER="openai_compat",
+                                AI_BASE_URL="https://main.example/v1", AI_API_KEYS="k1",
+                                AI_BRIEF_BASE_URL="https://b.example/v1/",
+                                AI_BRIEF_API_KEYS="b1")
+        with patch.object(ab.config, "ai_brief_endpoint", cfg.ai_brief_endpoint):
+            client = ab.MarketBriefer()._get_client()
+        self.assertEqual(client.base_url, "https://b.example/v1")
+
+    def test_extra_keys_are_masked_in_logs(self):
+        from core import secret_guard
+        cfg = types.SimpleNamespace(MT5_PASSWORD="", TELEGRAM_TOKEN="", AI_API_KEYS=[],
+                                    AI_BRIEF_API_KEYS=["brief-key-ZZ9911"])  # secret-scan: allow
+        before = set(secret_guard._known_values)
+        try:
+            secret_guard.install_log_redaction(cfg)
+            self.assertNotIn("brief-key-ZZ9911", secret_guard.redact("oops brief-key-ZZ9911"))
+        finally:
+            secret_guard._known_values.clear()
+            secret_guard._known_values.update(before)
+
+
+class TestNewsFeeds(unittest.TestCase):
+    URLS = "https://a.example/rss,https://b.example/rss,https://c.example/rss"
+
+    def _watcher(self):
+        from core import news
+        with patch.object(news.config, "NEWS_RSS_URL", self.URLS, create=True), \
+                patch.object(news.config, "NEWS_ENABLED", True, create=True):
+            return news, news.NewsWatcher()
+
+    def test_default_has_several_feeds(self):
+        cfg = _load_config_copy("balanced")
+        urls = [u for u in cfg.NEWS_RSS_URL.split(",") if u.strip()]
+        self.assertGreaterEqual(len(urls), 3)
+        self.assertTrue(all(u.startswith("https://") for u in urls))
+
+    def test_falls_through_a_blocked_feed_and_remembers_the_good_one(self):
+        news, w = self._watcher()
+        calls = []
+
+        def one(url):
+            calls.append(url)
+            if "a.example" in url:
+                raise OSError("sinkholed")
+            return [(1.0, "Fed holds rates")]
+        with patch.object(w, "_fetch_one", side_effect=one):
+            self.assertEqual(w._fetch(), [(1.0, "Fed holds rates")])
+            self.assertEqual(calls, ["https://a.example/rss", "https://b.example/rss"])
+            calls.clear()
+            w._fetch()                       # starts from the feed that worked
+        self.assertEqual(calls[0], "https://b.example/rss")
+
+    def test_all_feeds_down_raises_so_the_cache_is_served(self):
+        news, w = self._watcher()
+        with patch.object(w, "_fetch_one", side_effect=OSError("down")):
+            with self.assertRaises(OSError):
+                w._fetch()
+            self.assertEqual(w.refresh_if_due(), [])      # contained, no crash
+
+    def test_investing_com_date_format_is_read_as_utc(self):
+        news, w = self._watcher()
+        xml = (b"<rss><channel><item><title>Dollar firms</title>"
+               b"<pubDate>2026-10-14 20:04:18</pubDate></item></channel></rss>")
+
+        class _R:
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+            def read(s, n=-1): return xml
+        with patch.object(news.urllib.request, "urlopen", return_value=_R()):
+            (ts, title), = w._fetch_one("https://a.example/rss")
+        import datetime as _dt
+        self.assertEqual(_dt.datetime.fromtimestamp(ts, _dt.timezone.utc),
+                         _dt.datetime(2026, 10, 14, 20, 4, 18, tzinfo=_dt.timezone.utc))
+
+
+class TestFreshStart(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fresh_")
+        self.old = os.getcwd()
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import fresh_start
+        self.fs = fresh_start
+        os.chdir(self.tmp)                    # fresh_start chdir'd to ROOT at import
+        data = os.path.join("D", "data")
+        os.makedirs(data)
+        os.makedirs(os.path.join("D", "models"))
+        os.makedirs("logs")
+        self.files = {
+            "logs/bot.log": "x", "bot_forever_log.txt": "x",
+            "D/data/risk_state.json": "{}", "D/data/ai_directives.json": "{}",
+            "D/data/ai_decisions.csv": "a", "D/data/news_seen.json": "{}",
+            "D/models/smc_model.pkl": "m", "D/models/smc_scaler.pkl": "s",
+            "D/data/patterns.json": "{}", "D/data/trade_log.csv": "t"}
+        for k, v in self.files.items():
+            with open(k, "w") as f:
+                f.write(v)
+        old_time = time.time() - 600
+        os.utime("logs/bot.log", (old_time, old_time))
+        c = fresh_start.config
+        self.patches = [patch.object(c, n, v, create=True) for n, v in {
+            "DATA_ROOT_PATH": "D", "LOG_PATH": "logs/bot.log",
+            "MODEL_PATH": "D/models/smc_model.pkl", "SCALER_PATH": "D/models/smc_scaler.pkl",
+            "PATTERN_DATA_PATH": "D/data/patterns.json",
+            "TRADE_LOG_PATH": "D/data/trade_log.csv",
+            "AI_JOURNAL_PATH": "D/data/ai_decisions.csv",
+            "NEWS_SEEN_PATH": "D/data/news_seen.json",
+            "AI_REGIME_STATE_PATH": "D/data/ai_directives.json"}.items()]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        os.chdir(self.old)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, *argv):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self.fs.main(list(argv))
+        return rc, buf.getvalue()
+
+    def test_dry_run_changes_nothing(self):
+        rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertIn("DRY RUN", out)
+        for k in self.files:
+            self.assertTrue(os.path.exists(k), k)
+        self.assertFalse(os.path.exists("backups"))
+
+    def test_yes_backs_up_then_resets_runtime_data_but_keeps_the_model(self):
+        rc, out = self._run("--yes")
+        self.assertEqual(rc, 0, out)
+        for gone in ("logs/bot.log", "bot_forever_log.txt", "D/data/risk_state.json",
+                     "D/data/ai_directives.json", "D/data/ai_decisions.csv",
+                     "D/data/news_seen.json"):
+            self.assertFalse(os.path.exists(gone), gone)
+        for kept in ("D/models/smc_model.pkl", "D/models/smc_scaler.pkl",
+                     "D/data/patterns.json", "D/data/trade_log.csv"):
+            self.assertTrue(os.path.exists(kept), kept)
+        (bk,) = os.listdir("backups")
+        self.assertTrue(os.path.exists(os.path.join("backups", bk, "D/data/risk_state.json")))
+
+    def test_all_also_resets_model_and_history(self):
+        rc, _ = self._run("--yes", "--all")
+        self.assertEqual(rc, 0)
+        for k in self.files:
+            self.assertFalse(os.path.exists(k), k)
+
+    def test_refuses_while_the_bot_is_writing_its_log(self):
+        os.utime("logs/bot.log", None)                # "just written"
+        rc, out = self._run("--yes")
+        self.assertEqual(rc, 2)
+        self.assertIn("RUNNING", out)
+        self.assertTrue(os.path.exists("D/data/risk_state.json"))
+        rc, _ = self._run("--yes", "--force")
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

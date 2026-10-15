@@ -358,6 +358,12 @@ AI_ENTRY_APPEAL_MIN_CONFIDENCE = _float_env("AI_ENTRY_APPEAL_MIN_CONFIDENCE", 0.
 # ════════════════════════════════════════════════════════════
 AI_BRIEF_ENABLED          = _bool_env("AI_BRIEF_ENABLED", SCALPER)
 AI_BRIEF_MODEL            = _str_env("AI_BRIEF_MODEL", "")      # "" = AI_MODEL
+# The Analyst is the biggest AI consumer (about one call per minute per symbol).
+# It can run on its OWN provider/keys so a free tier's daily token cap on the
+# entry gate + Guardian is not eaten by it. Empty = share AI_BASE_URL/AI_API_KEYS.
+AI_BRIEF_BASE_URL         = _str_env("AI_BRIEF_BASE_URL", "")
+AI_BRIEF_API_KEYS         = [k.strip() for k in
+                             os.getenv("AI_BRIEF_API_KEYS", "").split(",") if k.strip()]
 AI_BRIEF_INTERVAL_SECONDS = _float_env("AI_BRIEF_INTERVAL_SECONDS", 30.0)
 AI_BRIEF_TTL_SECONDS      = _float_env("AI_BRIEF_TTL_SECONDS", 90.0)
 AI_BRIEF_BARS             = _int_env("AI_BRIEF_BARS", 24)
@@ -406,7 +412,14 @@ SCALP_MAX_HOLD_SECONDS    = _float_env("SCALP_MAX_HOLD_SECONDS", 240.0)
 
 # ── News (context for the AI + Telegram alerts) ──────────────
 NEWS_ENABLED       = _bool_env("NEWS_ENABLED", True)
-NEWS_RSS_URL       = _str_env("NEWS_RSS_URL", "https://www.fxstreet.com/rss/news")
+# Comma-separated list, tried in order until one answers (a DNS/ISP block on a
+# single site - fxstreet resolves to 0.0.0.0 on some networks - no longer
+# blinds the news filter). Verified RSS 2.0 on 2026-10-15.
+NEWS_RSS_URL       = _str_env(
+    "NEWS_RSS_URL",
+    "https://www.fxstreet.com/rss/news,"
+    "https://investinglive.com/feed/news,"
+    "https://www.investing.com/rss/news_1.rss")
 NEWS_POLL_SECONDS  = 600.0
 NEWS_MAX_AGE_HOURS = 2
 NEWS_SEEN_PATH     = f"{DATA_ROOT_PATH}/data/news_seen.json"
@@ -475,9 +488,24 @@ def ai_regime_on():
     return bool(globals().get("AI_REGIME_ENABLED", False)) and ai_plumbing_ready()
 
 
+def ai_brief_endpoint():
+    """(base_url, [keys]) the Analyst talks to: its own when AI_BRIEF_BASE_URL
+    and AI_BRIEF_API_KEYS are both set, otherwise the shared AI endpoint."""
+    base = str(globals().get("AI_BRIEF_BASE_URL", "") or "").strip()
+    keys = list(globals().get("AI_BRIEF_API_KEYS", []) or [])
+    if base and keys:
+        return base, keys
+    return globals().get("AI_BASE_URL", ""), list(globals().get("AI_API_KEYS", []) or [])
+
+
 def ai_brief_on():
     """AI Analyst: an independent chart read per symbol, kept fresh."""
-    return bool(globals().get("AI_BRIEF_ENABLED", False)) and ai_plumbing_ready()
+    if not globals().get("AI_BRIEF_ENABLED", False):
+        return False
+    if (str(globals().get("AI_PROVIDER", "disabled")).lower() == "disabled"):
+        return False
+    base, keys = ai_brief_endpoint()
+    return bool(keys) and bool(str(base).strip())
 
 
 def ai_any_on():

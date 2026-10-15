@@ -10,9 +10,11 @@ import json
 sys.modules['MetaTrader5'] = MagicMock()
 import MetaTrader5 as mt5
 
+import _isolate_env                # noqa: F401,E402  (never read the real .env)
 import config
 # Update config for test
-config.DATA_ROOT_PATH = "SMC_Bot_Data_Test"
+import tempfile
+config.DATA_ROOT_PATH = tempfile.mkdtemp(prefix="smc_v17_")   # never touch tracked files
 config.MODEL_PATH = f"{config.DATA_ROOT_PATH}/models/smc_model.pkl"
 config.SCALER_PATH = f"{config.DATA_ROOT_PATH}/models/smc_scaler.pkl"
 config.TRADE_LOG_PATH = f"{config.DATA_ROOT_PATH}/data/trade_log.csv"
@@ -29,7 +31,7 @@ class TestBotV17(unittest.TestCase):
         """Verify that TradeLogger uses the persistent DATA_ROOT_PATH"""
         logger = TradeLogger()
         self.assertTrue(os.path.exists(config.TRADE_LOG_PATH))
-        self.assertIn("SMC_Bot_Data_Test", logger.path)
+        self.assertIn(os.path.basename(config.DATA_ROOT_PATH), logger.path)
 
     def test_rolling_window_training(self):
         """Verify rolling window logic in training"""

@@ -197,6 +197,7 @@ def install_log_redaction(config_module=None):
             getattr(config_module, "MT5_PASSWORD", ""),
             getattr(config_module, "TELEGRAM_TOKEN", ""),
             getattr(config_module, "AI_API_KEYS", []),
+            getattr(config_module, "AI_BRIEF_API_KEYS", []),
         )
     root = logging.getLogger()
     flt = RedactingFilter()

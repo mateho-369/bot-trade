@@ -140,7 +140,8 @@ scalp_stats           = {'guard_closes': 0, 'flip_closes': 0}
 news_watcher = None
 if getattr(config, 'NEWS_ENABLED', False):
     news_watcher = NewsWatcher()
-    logger.info(f"News feed ON ({config.NEWS_RSS_URL} every "
+    logger.info(f"News feed ON ({len(news_watcher.urls)} feed(s), first "
+                f"{news_watcher.url} every "
                 f"{config.NEWS_POLL_SECONDS:.0f}s, keyword alerts)")
 
 if config.ai_entry_on():

@@ -420,9 +420,10 @@ class MarketBriefer:
     # ── the one network call (runs on the AI bus worker) ─────
     def _get_client(self):
         if self._client is None:
+            base_url, api_keys = config.ai_brief_endpoint()
             self._client = OpenAICompatClient(
-                base_url=config.AI_BASE_URL,
-                api_key=config.AI_API_KEYS,
+                base_url=base_url,
+                api_key=api_keys,
                 model=(getattr(config, "AI_BRIEF_MODEL", "") or config.AI_MODEL),
                 timeout_seconds=self.timeout,
                 max_output_tokens=int(getattr(config, "AI_BRIEF_MAX_TOKENS", 350)),

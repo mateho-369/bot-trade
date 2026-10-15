@@ -30,3 +30,7 @@ SMC_Bot_Data/data/patterns.json
 bot_forever_log.txt
 install_log.txt
 _mt5_diag*.py
+
+# test scratch data (tests now use temp dirs)
+SMC_Bot_Data_Test/
+backups/

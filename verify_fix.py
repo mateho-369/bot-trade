@@ -9,6 +9,7 @@ import numpy as np
 sys.modules['MetaTrader5'] = MagicMock()
 import MetaTrader5 as mt5
 
+import _isolate_env                # noqa: F401,E402  (never read the real .env)
 import config
 from core.trade_manager import manage_open_trade
 from ml.model import TradeLogger

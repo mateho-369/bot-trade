@@ -37,6 +37,7 @@ import pandas as pd
 # main (which instantiates TradeLogger / SMCModel at import time).
 _TMP = tempfile.mkdtemp(prefix="bot_ai_test_")
 
+import _isolate_env                # noqa: F401,E402  (never read the real .env)
 import config
 config.DATA_ROOT_PATH    = _TMP
 config.MODEL_PATH        = f"{_TMP}/models/smc_model.pkl"

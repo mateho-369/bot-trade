@@ -193,6 +193,11 @@ def check_strategy(config):
                       f"{config.SCALP_GIVEBACK_PCT:.0%} · early cut "
                       f"{config.SCALP_EARLY_CUT_PCT:.0%} · max hold "
                       f"{config.SCALP_MAX_HOLD_SECONDS:.0f}s")
+        if config.ai_brief_on() and config.AI_BRIEF_TTL_SECONDS < config.AI_BRIEF_INTERVAL_SECONDS + 20:
+            soft(f"AI_BRIEF_TTL_SECONDS={config.AI_BRIEF_TTL_SECONDS:g} is not longer than "
+                 f"AI_BRIEF_INTERVAL_SECONDS={config.AI_BRIEF_INTERVAL_SECONDS:g} + 20: the "
+                 f"brief would be stale before the next one arrives and the fast lane / veto "
+                 f"would rarely apply. Set the TTL to the interval + 30 or more.")
         if config.AI_WORKER_THREADS < 2:
             soft(f"AI_WORKER_THREADS={config.AI_WORKER_THREADS}: with the Analyst on, "
                  f"briefs and entry reviews share the lane - use 3 (the scalper default; "
@@ -219,21 +224,28 @@ def check_strategy(config):
         # $ scalping sizes the lot from the $ target, so %-risk x positions is not
         # what is at stake here - say what is.
         per_stop = config.SCALP_TARGET_USD            # stop ~ TP distance => ~ target
-        worst = per_stop * config.MAX_POSITIONS
+        bal = _LIVE.get("balance")
+        thr = getattr(config, "SMALL_BALANCE_THRESHOLD", 50)
+        small = bool(bal) and bal < thr
+        npos = 1 if small else config.MAX_POSITIONS   # = risk_manager.positions_allowed
+        worst = per_stop * npos
         say(INFO, f"$ risk · lot sized from the ${config.SCALP_TARGET_USD:g} target (the %-risk "
                   f"setting is not used) · a stop-out is ~${per_stop:g}, up to "
-                  f"{config.MAX_POSITIONS} positions at once = ~${worst:g}")
-        bal = _LIVE.get("balance")
+                  f"{npos} position(s) at once = ~${worst:g}"
+                  + (f" · balance is under ${thr:g}, so only 1 position at a time "
+                     f"(MAX_POSITIONS={config.MAX_POSITIONS} applies from ${thr:g})"
+                     if small else
+                     f" · below ${thr:g} balance only 1 position is allowed"))
         if bal and bal > 0:
             pct = worst / bal * 100.0
             lim = getattr(config, "DAILY_MAX_LOSS_PERCENT", 0) or 0
             say(INFO, f"that is ~{pct:.0f}% of the ${bal:,.2f} balance; daily loss halt = "
-                      f"{lim:g}% (~${bal * lim / 100.0:,.2f})")
+                      f"{lim:g}% (~${bal * lim / 100.0:,.2f}, about "
+                      f"{max(1, int(bal * lim / 100.0 // max(per_stop, 0.01)))} stop-outs)")
             if lim and pct >= lim:
-                soft(f"all {config.MAX_POSITIONS} positions stopped out = ~{pct:.0f}% of the "
+                soft(f"all {npos} position(s) stopped out = ~{pct:.0f}% of the "
                      f"balance, at or above the {lim:g}% daily halt: on a small account a few "
-                     f"stop-outs end the day. Lower SCALP_TARGET_USD (e.g. 1.5) or "
-                     f"MAX_POSITIONS.")
+                     f"stop-outs end the day. Lower SCALP_TARGET_USD or MAX_POSITIONS.")
     else:
         heat = round(config.RISK_PERCENT_PER_TRADE * config.MAX_POSITIONS, 2)
         say(INFO, f"risk {config.RISK_PERCENT_PER_TRADE}% × {config.MAX_POSITIONS} positions "

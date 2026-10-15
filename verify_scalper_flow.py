@@ -38,6 +38,7 @@ import pandas as pd                # noqa: E402
 ROOT = os.path.dirname(os.path.abspath(__file__))
 _TMP = tempfile.mkdtemp(prefix="bot_scalper_test_")
 
+import _isolate_env                # noqa: F401,E402  (never read the real .env)
 import config                        # noqa: E402
 config.DATA_ROOT_PATH = _TMP
 config.MODEL_PATH = f"{_TMP}/models/smc_model.pkl"

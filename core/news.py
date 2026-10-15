@@ -32,7 +32,10 @@ _UA = "boss-smc-bot/1.9.4 (news-feed)"
 
 class NewsWatcher:
     def __init__(self):
-        self.url = getattr(config, "NEWS_RSS_URL", "")
+        raw = str(getattr(config, "NEWS_RSS_URL", "") or "")
+        self.urls = [u.strip() for u in raw.split(",") if u.strip()]
+        self.url = self.urls[0] if self.urls else ""
+        self._good = 0                       # index of the feed that last worked
         self.poll = float(getattr(config, "NEWS_POLL_SECONDS", 600))
         self.max_age_h = float(getattr(config, "NEWS_MAX_AGE_HOURS", 12))
         self.keywords = [k.lower() for k in
@@ -67,7 +70,25 @@ class NewsWatcher:
 
     # ── fetching ─────────────────────────────────────────────
     def _fetch(self):
-        req = urllib.request.Request(self.url, headers={"User-Agent": _UA,
+        """Try the feeds in order, starting with the one that last worked; the
+        first that parses wins. Raises the last error when all of them fail."""
+        last = None
+        n = len(self.urls)
+        for k in range(n):
+            i = (self._good + k) % n
+            try:
+                out = self._fetch_one(self.urls[i])
+            except Exception as e:
+                last = e
+                continue
+            if i != self._good:
+                logger.info(f"news feed switched to {self.urls[i]}")
+            self._good = i
+            return out
+        raise last if last else RuntimeError("no news feed configured")
+
+    def _fetch_one(self, url):
+        req = urllib.request.Request(url, headers={"User-Agent": _UA,
                                                         "Accept": "application/rss+xml, application/xml, text/xml"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read(262144)
@@ -84,7 +105,13 @@ class NewsWatcher:
                     from email.utils import parsedate_to_datetime
                     ts = parsedate_to_datetime(pub).timestamp()
                 except Exception:
-                    pass
+                    # investing.com writes "2026-10-14 20:04:18" (not RFC 822): read it
+                    # as UTC instead of calling an old headline "just now"
+                    try:
+                        ts = datetime.strptime(pub[:19], "%Y-%m-%d %H:%M:%S") \
+                            .replace(tzinfo=timezone.utc).timestamp()
+                    except Exception:
+                        pass
             out.append((ts, title))
         return out
 
