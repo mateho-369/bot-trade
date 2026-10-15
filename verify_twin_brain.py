@@ -968,5 +968,51 @@ class TestGuardianBriefing(FlowCase):
         self.assertIn("bank_at_usd", sm["scalp_guard_will"])
 
 
+class TestPreflightScalperNotes(unittest.TestCase):
+    """The scalper profile's own numbers must not be reported as mistakes, and the
+    $-mode risk line must say what is really at stake on a small account."""
+
+    def _run(self, fn_name, balance=None, **env):
+        import io
+        import contextlib
+        import preflight
+        cfg = _load_config_copy(
+            "scalper", AI_PROVIDER="openai_compat", AI_API_KEYS="k",
+            AI_ENABLED="true", **env)
+        preflight._LIVE.clear()
+        if balance is not None:
+            preflight._LIVE["balance"] = balance
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            getattr(preflight, fn_name)(cfg)
+        return buf.getvalue()
+
+    def test_scalper_defaults_raise_no_tightness_or_looseness_warning(self):
+        out = self._run("check_ai", AI_ENTRY_MAX_AGE_SECONDS="10.0")
+        self.assertNotIn("much tighter", out)
+        out = self._run("check_strategy", MAX_SPREAD_COST_PCT="30.0")
+        self.assertNotIn("is loose", out)
+
+    def test_a_really_tight_value_is_still_reported(self):
+        out = self._run("check_ai", AI_ENTRY_MAX_AGE_SECONDS="1.0")
+        self.assertIn("much tighter", out)
+
+    def test_small_account_gets_a_dollar_risk_warning(self):
+        out = self._run("check_strategy", balance=32.27)
+        self.assertIn("$ risk", out)
+        self.assertIn("~28% of the $32.27 balance", out)
+        self.assertIn("stop-outs end the day", out)
+
+    def test_big_account_gets_the_info_line_but_no_warning(self):
+        out = self._run("check_strategy", balance=5000.0)
+        self.assertIn("% of the $5,000.00 balance", out)
+        self.assertNotIn("stop-outs end the day", out)
+
+    def test_entry_gate_log_line_matches_the_policy(self):
+        import inspect
+        src = inspect.getsource(main)
+        self.assertIn("on silence: trade the bot's own signal", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

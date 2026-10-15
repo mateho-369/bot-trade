@@ -25,6 +25,9 @@ problems = []
 warnings = []
 
 
+_LIVE = {}          # facts learned from the live MT5 check (balance)
+
+
 def say(tag, msg):
     print(f"  {tag} {msg}")
 
@@ -134,6 +137,7 @@ def check_connect():
     say(OK, f"terminal build {getattr(info, 'build', '?')} · connected={getattr(info, 'connected', '?')}")
     acc = mt5.account_info()
     if acc:
+        _LIVE["balance"] = float(acc.balance)
         say(INFO, f"balance {acc.balance} {acc.currency} · leverage 1:{acc.leverage} · "
                   f"margin_mode {getattr(acc, 'margin_mode', '?')}")
         if getattr(acc, "limit_orders", 0) and acc.limit_orders <= 0:
@@ -203,14 +207,34 @@ def check_strategy(config):
     if config.MAX_SPREAD_COST_PCT <= 0:
         soft("MAX_SPREAD_COST_PCT=0 → the cost gate is OFF: the bot can take trades whose "
              "spread is a big share of the stop (the #1 documented reason for losing).")
-    elif config.MAX_SPREAD_COST_PCT > 25:
+    elif config.MAX_SPREAD_COST_PCT > (35 if getattr(config, "SCALPER", False) else 25):
         soft(f"MAX_SPREAD_COST_PCT={config.MAX_SPREAD_COST_PCT} is loose; 10-20 is the "
-             f"useful band.")
-    heat = round(config.RISK_PERCENT_PER_TRADE * config.MAX_POSITIONS, 2)
-    say(INFO, f"risk {config.RISK_PERCENT_PER_TRADE}% × {config.MAX_POSITIONS} positions "
-              f"= {heat}% account heat · fixed LOT_SIZE={config.LOT_SIZE}")
-    if heat > 3.0:
-        soft(f"{heat}% of the account at risk at once is aggressive for a scalper")
+             f"useful band (the scalper profile itself uses 30).")
+    if getattr(config, "SCALPER", False) and getattr(config, "SCALP_USD_MODE", False):
+        # $ scalping sizes the lot from the $ target, so %-risk x positions is not
+        # what is at stake here - say what is.
+        per_stop = config.SCALP_TARGET_USD            # stop ~ TP distance => ~ target
+        worst = per_stop * config.MAX_POSITIONS
+        say(INFO, f"$ risk · lot sized from the ${config.SCALP_TARGET_USD:g} target (the %-risk "
+                  f"setting is not used) · a stop-out is ~${per_stop:g}, up to "
+                  f"{config.MAX_POSITIONS} positions at once = ~${worst:g}")
+        bal = _LIVE.get("balance")
+        if bal and bal > 0:
+            pct = worst / bal * 100.0
+            lim = getattr(config, "DAILY_MAX_LOSS_PERCENT", 0) or 0
+            say(INFO, f"that is ~{pct:.0f}% of the ${bal:,.2f} balance; daily loss halt = "
+                      f"{lim:g}% (~${bal * lim / 100.0:,.2f})")
+            if lim and pct >= lim:
+                soft(f"all {config.MAX_POSITIONS} positions stopped out = ~{pct:.0f}% of the "
+                     f"balance, at or above the {lim:g}% daily halt: on a small account a few "
+                     f"stop-outs end the day. Lower SCALP_TARGET_USD (e.g. 1.5) or "
+                     f"MAX_POSITIONS.")
+    else:
+        heat = round(config.RISK_PERCENT_PER_TRADE * config.MAX_POSITIONS, 2)
+        say(INFO, f"risk {config.RISK_PERCENT_PER_TRADE}% × {config.MAX_POSITIONS} positions "
+                  f"= {heat}% account heat · fixed LOT_SIZE={config.LOT_SIZE}")
+        if heat > 3.0:
+            soft(f"{heat}% of the account at risk at once is aggressive for a scalper")
     for name in ("DAILY_MAX_LOSS_PERCENT", "MAX_DRAWDOWN_PERCENT", "MIN_FREE_MARGIN_BUFFER",
                  "CONSEC_LOSS_LIMIT"):
         val = getattr(config, name, None)
@@ -247,8 +271,11 @@ def check_ai(config):
                  "2nd key in AI_API_KEYS if you run 4 symbols")
     else:
         say(INFO, "AI off — bot trades its deterministic path alone (nothing is broken)")
-    caps = {"AI_ENTRY_MAX_AGE_SECONDS": 45.0, "AI_RESULT_TTL_SECONDS": 120.0,
-            "AI_QUEUE_MAX": 12, "AI_TIMEOUT_SECONDS": 8.0}
+    scalper = getattr(config, "SCALPER", False)
+    # the scalper profile ships its own, deliberately tighter numbers: compare with those
+    caps = {"AI_ENTRY_MAX_AGE_SECONDS": 10.0 if scalper else 45.0,
+            "AI_RESULT_TTL_SECONDS": 120.0,
+            "AI_QUEUE_MAX": 12, "AI_TIMEOUT_SECONDS": 4.0 if scalper else 8.0}
     for k, healthy in caps.items():
         v = float(getattr(config, k, healthy))
         if k.endswith("_SECONDS") and v <= 0:
