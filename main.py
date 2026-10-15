@@ -148,7 +148,10 @@ if config.ai_entry_on():
     ai_reviewer = AIReviewer(ai_journal)
     logger.info(f"AI entry gate ON (provider={config.AI_PROVIDER}, "
                 f"model={config.AI_MODEL}, min_conf={config.AI_MIN_CONFIDENCE}, "
-                f"fail-closed)")
+                + ("on silence: trade the bot's own signal after "
+                   f"{config.ai_entry_budget_seconds():.1f}s, a real REJECT is final)"
+                   if getattr(config, 'AI_ENTRY_TIMEOUT_MODE', 'block') == 'proceed'
+                   else "fail-closed)"))
 if config.ai_position_on():
     ai_journal = ai_journal or AIJournal(config.AI_JOURNAL_PATH)
     ai_position_reviewer = PositionReviewer(ai_journal)
