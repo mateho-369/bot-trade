@@ -220,3 +220,87 @@ def generate_sr_signals(h1: pd.DataFrame, h4: pd.DataFrame,
                     time_stop_bars=time_stop_bars, features=dict(feats)))
                 break
     return signals
+
+
+def diagnose_sr_funnel(h1: pd.DataFrame, h4: pd.DataFrame,
+                       params: Optional[dict] = None) -> dict:
+    """Stage-by-stage funnel per year: which filter kills the signals?
+
+    Built to answer 'why zero SR trades before 2021?' on real data.
+    Returns {first_h4_time, warmup_ready_time, first_signal_time,
+    funnel: DataFrame[year, bars, atr_ok, session_ok, h4_trend_ok,
+    momentum_ok, levels_ok, signals]}. Level construction here counts
+    availability only (cluster/cross/consumed logic lives in
+    generate_sr_signals); signals come from generate_sr_signals itself.
+    """
+    p = dict(DEFAULTS)
+    if params:
+        p.update(params)
+    h1i = _as_indexed(h1)
+    h4i = _as_indexed(h4)
+    atr_s = calc_atr(h1i, p["atr_len"])
+    ema4 = calc_ema(h4i["close"], p["h4_ema_len"])
+    h4_close_times = h4i.index + pd.Timedelta(hours=4)
+    h1_close_times = h1i.index + pd.Timedelta(hours=1)
+    h4_pos = np.searchsorted(h4_close_times.values, h1_close_times.values,
+                             side="right") - 1
+    warm_i = int(np.argmax(ema4.notna().to_numpy())) if ema4.notna().any() else -1
+    closes = h1i["close"].to_numpy(float)
+    opens = h1i["open"].to_numpy(float)
+    highs = h1i["high"].to_numpy(float)
+    lows = h1i["low"].to_numpy(float)
+    years = h1i.index.year.to_numpy()
+    rows = {}
+    for i in range(1, len(h1i)):
+        y = int(years[i])
+        r = rows.setdefault(y, {"year": y, "bars": 0, "atr_ok": 0,
+                                "session_ok": 0, "h4_trend_ok": 0,
+                                "momentum_ok": 0, "levels_ok": 0,
+                                "signals": 0})
+        r["bars"] += 1
+        atr = float(atr_s.iloc[i])
+        if not (np.isfinite(atr) and atr > 0):
+            continue
+        r["atr_ok"] += 1
+        t = h1i.index[i]
+        hour = t.hour + t.minute / 60.0
+        if not (p["session_start"] <= hour < p["session_end"]):
+            continue
+        if p["news_start"] <= hour < p["news_end"]:
+            continue
+        r["session_ok"] += 1
+        j = int(h4_pos[i])
+        if j < 0 or not np.isfinite(ema4.iloc[j]):
+            continue
+        h4_up = float(h4i["close"].iloc[j]) > float(ema4.iloc[j])
+        h4_down = float(h4i["close"].iloc[j]) < float(ema4.iloc[j])
+        if not (h4_up or h4_down):
+            continue
+        r["h4_trend_ok"] += 1
+        body = closes[i] - opens[i]
+        rng = highs[i] - lows[i]
+        mom_buy = body >= p["momentum_body"] * atr and \
+            (rng <= 0 or closes[i] >= lows[i] + p["close_pos"] * rng)
+        mom_sell = -body >= p["momentum_body"] * atr and \
+            (rng <= 0 or closes[i] <= highs[i] - p["close_pos"] * rng)
+        if not (mom_buy or mom_sell):
+            continue
+        r["momentum_ok"] += 1
+        # level availability (prev-day or any pivot in window, within range)
+        # prev-day levels exist iff some earlier calendar day is present
+        r["levels_ok"] += int(bool((h1i.index.date < t.date()).any()))
+    sigs = generate_sr_signals(h1, h4, params=params)
+    for s in sigs:
+        y = int((s.signal_time - pd.Timedelta(hours=1)).year)
+        if y in rows:
+            rows[y]["signals"] += 1
+    funnel = pd.DataFrame([rows[y] for y in sorted(rows)])
+    return {
+        "first_h1_time": h1i.index[0] if len(h1i) else None,
+        "first_h4_time": h4i.index[0] if len(h4i) else None,
+        "h4_bars": int(len(h4i)),
+        "warmup_ready_time": h4i.index[warm_i] if 0 <= warm_i < len(h4i) else None,
+        "first_signal_time": sigs[0].signal_time if sigs else None,
+        "total_signals": len(sigs),
+        "funnel": funnel,
+    }

@@ -61,6 +61,7 @@ def _indexed(bars: pd.DataFrame) -> pd.DataFrame:
     df = bars.copy()
     if "time" in df.columns:
         df = df.set_index(pd.to_datetime(df["time"], utc=True))
+        df = df.drop(columns=["time"])
     df.index = pd.to_datetime(df.index, utc=True)
     return df.sort_index()
 
