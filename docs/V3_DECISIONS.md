@@ -55,3 +55,20 @@ implementations: each item is built only in its own phase, behind its gate.
   frame starts at the first H1 bar (2018-06-28 00:00 UTC as returned).
   `tools/diagnose_sr.py` prints the real first H4 timestamp, the funnel
   per year and the first signal date on the Windows data.
+
+## Handoff continuation (2026-10-16, current session)
+- Owner's handoff explicitly requests archiving the full specification,
+  committing it, and pushing the current session branch so the local agent
+  can pull it. Current session branch is `arena/ba18f2e6-bot-trade`, starting
+  at `6a54fbb` (same tip as fetched `arena/a951958a-bot-trade`). This
+  supersedes the earlier session-specific branch name above; `main` is
+  untouched. No reset, merge or force-push is needed.
+- Full owner spec is archived in `docs/V3_SPEC.md`. The live Windows P2 v1
+  run remains frozen: no engine/cost/backtester/plan/runner changes and no
+  request to rerun. The checker is a separate read-only audit tool.
+- `docs/P2_CHECKER.md` documents evidence limits and inherited v1 semantic
+  caveats. They are review findings, NOT approved research changes. A
+  checker PASS means runner parity, not independent section-6 certification.
+- Do not begin P3, change the plan, or place demo orders before the owner
+  supplies the P2 outputs and approves the next phase. No multiprocessing
+  feature was added during this handoff.
