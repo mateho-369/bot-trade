@@ -8,8 +8,13 @@
 
 1. បើក **MetaTrader 5** (Exness) → login គណនី **DEMO** (`Exness-MT5Trial6`) → ធីក
    `Algo Trading` ឱ្យបើក។ ឆែកថា `XAUUSDm` មានក្នុង Market Watch (បើគ្មាន: right-click → Show All)។
-2. បើក terminal ក្នុង VS Code នៅ folder repo នេះ ហើយ `git pull` ឱ្យបាន code P1 ចុងក្រោយ។
-3. Secrets នៅ `~/.boss-bot/.env` ដដែល (MT5_LOGIN / MT5_PASSWORD / MT5_SERVER) — **កុំ paste
+2. **សំខាន់ — បើក history ឱ្យអស់សិន (បើរំលងជំហាននេះ អ្នកនឹងទាញបានតែប៉ុន្មានខែ):**
+   - ទៅ `Tools → Options → Charts` → ដាក់ **Max bars in chart = Unlimited** (និង
+     Max bars in history បើមាន) → ចុច OK → **បិទ MT5 ហើយបើកវិញ (restart terminal)**។
+   - បើក **chart XAUUSDm timeframe M1** ទុកចោលម្ដង ខ្លាច់ terminal ទាញ/load history
+     របស់ symbol នេះសិន (រង់ចាំដល់ chart លែងឃើញ "Waiting for update")។
+3. បើក terminal ក្នុង VS Code នៅ folder repo នេះ ហើយ `git pull` ឱ្យបាន code P1 ចុងក្រោយ។
+4. Secrets នៅ `~/.boss-bot/.env` ដដែល (MT5_LOGIN / MT5_PASSWORD / MT5_SERVER) — **កុំ paste
    password ទៅកន្លែងណាផ្សេង, កុំផ្ញើមកខ្ញុំ**។
 
 ## ១) ដំឡើង packages ម្ដង (2-10 នាទី តាម internet)
@@ -31,8 +36,8 @@ venv\Scripts\python.exe tools\scan_secrets.py --all
 
 Expected:
 ```
-......................                                                   [100%]
-22 passed in 0.xx s
+.................................                                        [100%]
+33 passed in 0.xx s
 secret scan: clean
 ```
 បើឃើញ `failed` → **ឈប់ត្រឹមនេះ** ហើយផ្ញើ output មកខ្ញុំ (កុំរត់ជំហានបន្ទាប់)។
@@ -88,7 +93,7 @@ trades ±15%, PF ±0.10, E[R] ±0.01R ទើបហៅថា "reproduced"។ ប�
 | `[FIX] symbol XAUUSDm not found` | XAUUSDm មិននៅក្នុង Market Watch → right-click Market Watch → Show All |
 | `ticks: broker returned none` | មិនមែន error ទេ — broker មិនឱ្យ tick history; bot ប្រើ bar spread ជំនួស (បានកត់ក្នុង report) |
 | Download យឺតខ្លាំងនៅ M1 | ធម្មតាលើកដំបូង (chunk 30 ថ្ងៃម្ដងៗ)។ ទុកឱ្យរត់ចប់; លើកក្រោយលឿន |
-| `22 passed` ក្លាយជា failed | ឈប់ ហើយផ្ញើ output មកខ្ញុំ — មានន័យថា code មានបញ្ហាពិត |
+| tests ក្លាយជា failed | ឈប់ ហើយផ្ញើ output មកខ្ញុំ — មានន័យថា code មានបញ្ហាពិត |
 | Server មិនបង្ហាញ `(DEMO ok)` | អ្នកមិននៅលើ demo ទេ — download នៅតែ read-only ប៉ុន្តែ **កុំ** រត់ bot រហូតដល់ដូរទៅ demo |
 
 ## ៦) បន្ទាប់ពីជំហាននេះ
