@@ -54,7 +54,7 @@ def _load_fixture(fixture_path):
 
 def run_p1(args) -> int:
     import pandas as pd
-    from core.backtester_v3 import run_backtest, summarise
+    from core.backtester_v3 import run_backtest, summarise, summarise_groups
     from core.costs import CostModel
     from core.signals.sr_h1 import generate_sr_signals
 
@@ -85,11 +85,35 @@ def run_p1(args) -> int:
         median_spread = 0.24  # documented Exness XAUUSDm live spread fallback
     cm = CostModel(default_spread_price=median_spread)
 
+    # spread-by-hour medians for the zero-spread fallback (real csv from
+    # the downloader if present, else computed from these H1 bars)
+    sbh = None
+    sbh_path = os.path.join(data_dir, f"{args.symbol}_spread_by_hour.csv")
+    if os.path.exists(sbh_path):
+        _c = pd.read_csv(sbh_path)
+        sbh = {int(r.hour_utc): float(r.spread_median) for r in _c.itertuples()}
+    elif "spread_points" in h1.columns:
+        _tmp = pd.DataFrame({"h": pd.to_datetime(h1["time"]).dt.hour,
+                             "sp": h1["spread_points"].astype(float) * point})
+        sbh = {int(k): float(v) for k, v in _tmp.groupby("h")["sp"].median().items()}
+
     signals = generate_sr_signals(h1, h4)
-    result = run_backtest(h1, signals, cost_model=cm, point=point)
+    # (a) per-bar real spread, bid/ask model + slippage 0.3x + stress run
+    result = run_backtest(h1, signals, cost_model=cm, point=point,
+                          spread_by_hour_price=sbh)
     s = summarise(result.trades)
-    stressed = run_backtest(h1, signals, cost_model=cm.stressed(1.5), point=point)
+    stressed = run_backtest(h1, signals, cost_model=cm.stressed(1.5), point=point,
+                            spread_by_hour_price=sbh)
     ss = summarise(stressed.trades)
+    # (b) duel methodology: FIXED 0.30 spread, no slippage -- the exact
+    # cost basis of REAL_WORLD_TEST.md, for an apples-to-apples compare
+    h1_duel = h1.copy()
+    h1_duel["spread_points"] = 0.30 / point
+    duel = run_backtest(h1_duel, signals,
+                        cost_model=CostModel(slippage_frac_of_spread=0.0,
+                                             default_spread_price=0.30),
+                        point=point)
+    sd = summarise(duel.trades)
 
     os.makedirs(os.path.join(ROOT, "research"), exist_ok=True)
     report_path = os.path.join(ROOT, "research", "P1_report.md")
@@ -106,8 +130,12 @@ def run_p1(args) -> int:
                  f"(point={point}); slippage 0.3x spread, commission 0")
     lines.append(f"- Signals: {len(signals)} · skipped (in-trade): {result.skipped_in_trade} "
                  f"· skipped (bad stop): {result.skipped_bad_stop}")
+    lines.append(f"- Spread fallback (hour-median/default, never free): "
+                 f"{result.spread_fallback_trades} trades")
     lines.append("")
-    lines.append("## Results (triple-barrier, SL-first, next-bar-open entry)")
+    lines.append("## Results (a) — per-bar real spread, bid/ask model "
+                 "(BUY ask-in/bid-out, SELL bid-in/ask-out, gaps at open, "
+                 "triple-barrier, SL-first, next-bar-open entry)")
     lines.append("")
     lines.append("| Metric | Net of cost | Costs x1.5 | Gross (no cost) |")
     lines.append("|---|---|---|---|")
@@ -123,6 +151,41 @@ def run_p1(args) -> int:
     lines.append(f"| Total cost | {s['total_cost_R']:.2f} R ({s['cost_share_of_gross_profit_pct']:.1f}% of gross profit) | {ss['total_cost_R']:.2f} R | 0 |")
     lines.append(f"| Trades/day | {s['trades_per_day']:.2f} | — | — |")
     lines.append("")
+    lines.append("## Results (b) — duel methodology (fixed 0.30 spread, "
+                 "no slippage; compare with REAL_WORLD_TEST.md)")
+    lines.append("")
+    lines.append("| Metric | Duel-method net |")
+    lines.append("|---|---|")
+    lines.append(f"| Trades | {sd['trades']} |")
+    lines.append(f"| Win rate | {sd['win_rate']*100:.1f}% |")
+    lines.append(f"| Profit factor | {_pf(sd['profit_factor_net'])} |")
+    lines.append(f"| Expectancy / trade | {sd['expectancy_R_net']:+.4f} R |")
+    _lo, _hi = sd["expectancy_ci95"]
+    lines.append(f"| Expectancy 95% bootstrap CI | [{_lo:+.4f}, {_hi:+.4f}] R |")
+    lines.append(f"| Max drawdown | {sd['max_drawdown_R']:.2f} R |")
+    lines.append(f"| Total net | {sd['total_net_R']:+.2f} R |")
+    lines.append(f"| Total cost | {sd['total_cost_R']:.2f} R |")
+    lines.append("")
+
+    def _split_tables(title, trades):
+        if trades is None or len(trades) == 0:
+            return
+        lines.append(f"### Splits — {title}")
+        lines.append("")
+        lines.append("| Group | Trades | WR | PF | E[R] net |")
+        lines.append("|---|---|---|---|---|")
+        dirs = ["BUY" if v == 1 else "SELL" for v in trades["direction"]]
+        for lbl, g in summarise_groups(trades, dirs).items():
+            lines.append(f"| {lbl} | {g['trades']} | {g['win_rate']*100:.1f}% | "
+                         f"{_pf(g['profit_factor_net'])} | {g['expectancy_R_net']:+.4f} R |")
+        years = [str(y) for y in pd.to_datetime(trades["entry_time"]).dt.year]
+        for lbl, g in summarise_groups(trades, years).items():
+            lines.append(f"| Year {lbl} | {g['trades']} | {g['win_rate']*100:.1f}% | "
+                         f"{_pf(g['profit_factor_net'])} | {g['expectancy_R_net']:+.4f} R |")
+        lines.append("")
+
+    _split_tables("(a) per-bar real spread", result.trades)
+    _split_tables("(b) duel fixed 0.30", duel.trades)
     if source.startswith("REAL"):
         d = DOCUMENTED_SR_H1
         lines.append("## Reproduction check vs documented duel (REAL_WORLD_TEST.md)")
@@ -135,11 +198,13 @@ def run_p1(args) -> int:
         lines.append("")
         lines.append(f"| | This run | Documented | Delta |")
         lines.append("|---|---|---|---|")
-        lines.append(f"| Trades | {s['trades']} | {d['trades']} | {s['trades']-d['trades']:+d} |")
-        lines.append(f"| Win rate | {s['win_rate']*100:.1f}% | {d['win_rate_pct']}% | {s['win_rate']*100-d['win_rate_pct']:+.1f} pp |")
-        lines.append(f"| Profit factor | {_pf(s['profit_factor_net'])} | {d['profit_factor']} | {s['profit_factor_net']-d['profit_factor']:+.3f} |")
-        lines.append(f"| Expectancy | {s['expectancy_R_net']:+.4f} R | {d['expectancy_R']:+.3f} R | {s['expectancy_R_net']-d['expectancy_R']:+.4f} R |")
-        lines.append(f"| Max DD | {s['max_drawdown_R']:.2f} R | {d['max_dd_R']} R | {s['max_drawdown_R']-d['max_dd_R']:+.2f} R |")
+        lines.append("Compared using run (b) (duel cost methodology):")
+        lines.append("")
+        lines.append(f"| Trades | {sd['trades']} | {d['trades']} | {sd['trades']-d['trades']:+d} |")
+        lines.append(f"| Win rate | {sd['win_rate']*100:.1f}% | {d['win_rate_pct']}% | {sd['win_rate']*100-d['win_rate_pct']:+.1f} pp |")
+        lines.append(f"| Profit factor | {_pf(sd['profit_factor_net'])} | {d['profit_factor']} | {sd['profit_factor_net']-d['profit_factor']:+.3f} |")
+        lines.append(f"| Expectancy | {sd['expectancy_R_net']:+.4f} R | {d['expectancy_R']:+.3f} R | {sd['expectancy_R_net']-d['expectancy_R']:+.4f} R |")
+        lines.append(f"| Max DD | {sd['max_drawdown_R']:.2f} R | {d['max_dd_R']} R | {sd['max_drawdown_R']-d['max_dd_R']:+.2f} R |")
     else:
         lines.append("## Reproduction check")
         lines.append("")
@@ -162,6 +227,9 @@ def run_p1(args) -> int:
           f"E[R] {s['expectancy_R_net']:+.4f} · maxDD {s['max_drawdown_R']:.2f}R · "
           f"cost {s['total_cost_R']:.2f}R")
     print(f"stress x1.5: PF {_pfv(ss['profit_factor_net'])} · E[R] {ss['expectancy_R_net']:+.4f}")
+    print(f"spread fallback trades: {result.spread_fallback_trades}")
+    print(f"duel (fixed 0.30): trades {sd['trades']} · PF {_pfv(sd['profit_factor_net'])} · "
+          f"E[R] {sd['expectancy_R_net']:+.4f}")
     print(f"report -> research/P1_report.md")
     return 0
 

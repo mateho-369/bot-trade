@@ -11,7 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-DEMO_MARKERS = ("demo", "trial")
+DEMO_MARKERS = ("demo", "trial")  # e.g. Exness-MT5Trial6, MetaQuotes-Demo
+# NOTE: "investing" was dropped in P1.1 -- no evidence a broker labels a
+# DEMO server with it, and a real-money server containing the word would
+# have been waved through. This function is the ONE shared demo check
+# (preflight.py imports it too; the two must never drift apart).
 
 
 def is_demo_server(server) -> bool:

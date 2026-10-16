@@ -17,6 +17,9 @@ import argparse
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from core.execution.live_gate import is_demo_server  # ONE shared demo check
+
 OK, FIX, WARN, INFO = "[OK ]", "[FIX]", "[!]", "[i]"
 PY_MIN = (3, 9)
 PY_MAX_SOFT = (3, 12)          # MetaTrader5 / numpy 1.26 wheels stop here
@@ -109,8 +112,8 @@ def check_broker(config):
     if not config.MT5_PASSWORD:
         soft("MT5_PASSWORD empty — only fine if you keep the terminal logged in and "
              "never restart it headless")
-    server = (config.MT5_SERVER or "").lower()
-    if server and not any(k in server for k in ("demo", "trial", "investing")):
+    server = config.MT5_SERVER or ""
+    if server and not is_demo_server(server):
         if getattr(config, "ALLOW_LIVE", False):
             soft(f"server '{config.MT5_SERVER}' does not look like a demo account "
                  f"and ALLOW_LIVE=true is set — REAL MONEY, owner-authorised.")

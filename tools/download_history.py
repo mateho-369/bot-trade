@@ -32,6 +32,15 @@ from core.data.history import (build_manifest, rates_to_frame,  # noqa: E402
 from core.execution.live_gate import check_live_start  # noqa: E402
 
 TF_CHUNK_DAYS = {"M1": 30, "M5": 90, "M15": 180, "H1": 365}
+# M1 since 2010 is millions of rows and slow: low timeframes default to
+# 2023-01-01 (--start-year overrides); H1 (and derived H4) go back to 2010.
+TF_DEFAULT_START_YEAR = {"M1": 2023, "M5": 2023, "M15": 2023, "H1": 2010}
+
+
+def resolve_start_year(tf_name: str, start_year, h1_start_year) -> int:
+    if tf_name == "H1":
+        return int(h1_start_year or TF_DEFAULT_START_YEAR["H1"])
+    return int(start_year or TF_DEFAULT_START_YEAR[tf_name])
 SYMBOL_INFO_FIELDS = [
     "name", "description", "currency_base", "currency_profit",
     "currency_margin", "digits", "point", "spread", "spread_float",
@@ -54,15 +63,12 @@ def _chunk_ranges(start, end, chunk_days):
 def download_rates(mt5, symbol, tf_name, tf_const, start, end):
     import pandas as pd
     frames = []
-    total_req = 0
     for a, b in _chunk_ranges(start, end, TF_CHUNK_DAYS[tf_name]):
         rates = mt5.copy_rates_range(symbol, tf_const, a, b)
-        total_req += 1
         if rates is not None and len(rates):
             frames.append(rates_to_frame(rates))
     if not frames:
         return None
-    import pandas as pd  # noqa: F811
     out = pd.concat(frames, ignore_index=True)
     out = out.sort_values("time").drop_duplicates("time").reset_index(drop=True)
     return out
@@ -74,7 +80,10 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="data")
     ap.add_argument("--tick-days", type=int, default=30,
                     help="days of ticks to fetch (0 = skip ticks)")
-    ap.add_argument("--start-year", type=int, default=2010)
+    ap.add_argument("--start-year", type=int, default=2023,
+                    help="first year for M1/M5/M15 (default 2023-01-01)")
+    ap.add_argument("--h1-start-year", type=int, default=2010,
+                    help="first year for H1 (default 2010)")
     args = ap.parse_args(argv)
 
     try:
@@ -122,10 +131,13 @@ def main(argv=None) -> int:
         tf_map = {"M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
                   "M15": mt5.TIMEFRAME_M15, "H1": mt5.TIMEFRAME_H1}
         end = datetime.now(timezone.utc)
-        start = datetime(args.start_year, 1, 1, tzinfo=timezone.utc)
         point = float(snap.get("point") or 0.01)
         m1 = None
+        print("rows per timeframe (as returned by the terminal):")
         for tf_name, tf_const in tf_map.items():
+            year = resolve_start_year(tf_name, args.start_year,
+                                      args.h1_start_year)
+            start = datetime(year, 1, 1, tzinfo=timezone.utc)
             df = download_rates(mt5, args.symbol, tf_name, tf_const, start, end)
             if df is None or df.empty:
                 print(f"[i] {tf_name}: no data returned by terminal")

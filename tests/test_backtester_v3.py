@@ -28,7 +28,7 @@ def sig(bar_index=0, direction=1, stop=99.0, target_R=2.0, tsb=None):
                            time_stop_bars=tsb, atr=1.0)
 
 
-FREE = CostModel(slippage_frac_of_spread=0.0)
+FREE = CostModel(slippage_frac_of_spread=0.0, default_spread_price=0.0)
 
 
 def test_tp_fill_next_bar_entry():
@@ -74,13 +74,18 @@ def test_time_barrier_exits_at_close():
 def test_costs_reduce_net_and_are_reported():
     df = bars([(100, 100.5, 99.5, 100, 24), (100, 101, 99.5, 100.5, 24),
                (100.5, 103, 100, 102.5, 24), (102.5, 103, 102, 102.5, 24)])
-    cm = CostModel()  # spread 24pts*0.01=$0.24, +30% slippage
+    cm = CostModel()  # spread 24pts*0.01=$0.24 (bid/ask) + 30% slippage
     res = run_backtest(df, [sig()], cost_model=cm, point=0.01)
     t = res.trades.iloc[0]
-    assert t.cost_price == pytest.approx(0.312)
-    assert t.net_R == pytest.approx(2.0 - 0.312)  # risk = $1
+    # BUY enters at ask: 100 + 0.24; risk = 1.24; TP = entry + 2R
+    assert t.entry == pytest.approx(100.24)
+    assert t.cost_price == pytest.approx(0.312)          # spread+slippage
+    # exec pnl at TP = 2R = 2.48; net = (2.48 - 0.072 slippage) / 1.24
+    assert t.net_R == pytest.approx((2.48 - 0.072) / 1.24)
+    assert t.spread_source == "bar"
     s = summarise(res.trades)
-    assert s["trades"] == 1 and s["total_cost_R"] == pytest.approx(0.312)
+    assert s["trades"] == 1
+    assert s["total_cost_R"] == pytest.approx(0.312 / 1.24)
 
 
 def test_one_position_at_a_time_and_sell_direction():
