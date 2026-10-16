@@ -111,9 +111,13 @@ def check_broker(config):
              "never restart it headless")
     server = (config.MT5_SERVER or "").lower()
     if server and not any(k in server for k in ("demo", "trial", "investing")):
-        soft(f"server '{config.MT5_SERVER}' does not look like a demo account — "
-             f"REAL MONEY. If that is intended, keep LOT_SIZE small and run 2-3 "
-             f"months of demo first (see REAL_WORLD_TEST.md).")
+        if getattr(config, "ALLOW_LIVE", False):
+            soft(f"server '{config.MT5_SERVER}' does not look like a demo account "
+                 f"and ALLOW_LIVE=true is set — REAL MONEY, owner-authorised.")
+        else:
+            need(f"server '{config.MT5_SERVER}' does not look like a demo account "
+                 f"and ALLOW_LIVE is not true — the bot will REFUSE to start. "
+                 f"Use a demo server, or set ALLOW_LIVE=true yourself for real money.")
     for sym in config.SYMBOLS:
         if not sym.strip():
             need("SYMBOLS contains an empty entry (check the comma list in .env)")

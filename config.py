@@ -71,6 +71,10 @@ def _str_env(name, default):
 MT5_LOGIN    = _int_env("MT5_LOGIN", 0)
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER   = os.getenv("MT5_SERVER",   "")
+# v3 safety gate (Hard Rule #2): real-money servers are refused at startup
+# unless the OWNER explicitly sets ALLOW_LIVE=true in .env. See
+# core/execution/live_gate.py. Default False = demo only.
+ALLOW_LIVE   = _bool_env("ALLOW_LIVE", False)
 
 # ── Symbols (4 pairs scanned every loop) ──────────────────────
 SYMBOLS = [s.strip() for s in

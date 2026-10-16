@@ -46,6 +46,17 @@ def connect():
         logger.error(f"MT5 login failed: {mt5.last_error()}")
         return False
     info = mt5.account_info()
+    # v3 Hard Rule #2: refuse non-demo accounts unless the owner set
+    # ALLOW_LIVE=true. Only enforced for a real (string) server name so
+    # mocked terminals in offline tests are unaffected.
+    _server = getattr(info, "server", "") if info is not None else ""
+    if isinstance(_server, str) and _server.strip():
+        _gate = check_live_start(_server,
+                                 bool(getattr(config, "ALLOW_LIVE", False)))
+        if not _gate.allowed:
+            logger.error(f"MT5 start refused: {_gate.reason}")
+            mt5.shutdown()
+            return False
     logger.info(f"MT5 Connected | Account: {info.login} | "
                 f"Balance: {info.balance} {info.currency} | "
                 f"Server: {info.server}")
