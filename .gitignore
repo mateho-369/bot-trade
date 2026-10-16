@@ -34,3 +34,8 @@ _mt5_diag*.py
 # test scratch data (tests now use temp dirs)
 SMC_Bot_Data_Test/
 backups/
+
+# v3 real market data from MT5 (Parquet) - never commit; MANIFEST.json is
+data/*.parquet
+data/**/*.parquet
+research/*.parquet
