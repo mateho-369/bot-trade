@@ -37,9 +37,12 @@ TF_CHUNK_DAYS = {"M1": 30, "M5": 90, "M15": 180, "H1": 365}
 TF_DEFAULT_START_YEAR = {"M1": 2023, "M5": 2023, "M15": 2023, "H1": 2010}
 
 
-def resolve_start_year(tf_name: str, start_year, h1_start_year) -> int:
+def resolve_start_year(tf_name: str, start_year, h1_start_year,
+                       full_history: bool = False) -> int:
     if tf_name == "H1":
         return int(h1_start_year or TF_DEFAULT_START_YEAR["H1"])
+    if full_history:
+        return 2018  # one-time deep fetch; terminal returns its earliest
     return int(start_year or TF_DEFAULT_START_YEAR[tf_name])
 SYMBOL_INFO_FIELDS = [
     "name", "description", "currency_base", "currency_profit",
@@ -84,6 +87,8 @@ def main(argv=None) -> int:
                     help="first year for M1/M5/M15 (default 2023-01-01)")
     ap.add_argument("--h1-start-year", type=int, default=2010,
                     help="first year for H1 (default 2010)")
+    ap.add_argument("--full-history", action="store_true",
+                    help="one-time: fetch M1/M5/M15 from 2018 (slow, large)")
     args = ap.parse_args(argv)
 
     try:
@@ -136,7 +141,8 @@ def main(argv=None) -> int:
         print("rows per timeframe (as returned by the terminal):")
         for tf_name, tf_const in tf_map.items():
             year = resolve_start_year(tf_name, args.start_year,
-                                      args.h1_start_year)
+                                      args.h1_start_year,
+                                      full_history=args.full_history)
             start = datetime(year, 1, 1, tzinfo=timezone.utc)
             df = download_rates(mt5, args.symbol, tf_name, tf_const, start, end)
             if df is None or df.empty:

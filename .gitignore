@@ -39,3 +39,5 @@ backups/
 data/*.parquet
 data/**/*.parquet
 research/*.parquet
+data/research/
+data/cache/

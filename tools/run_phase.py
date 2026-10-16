@@ -244,7 +244,35 @@ def main(argv=None) -> int:
     ap.add_argument("--fixture-path", default="tests/fixtures/XAUUSDm_M1_synthetic.parquet")
     ap.add_argument("--download", action="store_true", default=True,
                     help="download first if real data is missing (Windows/MT5)")
+    ap.add_argument("--engines", default="ORB,PULLBACK,SMC,RANGE,SQUEEZE",
+                    help="P2: comma-separated engine subset")
+    ap.add_argument("--tf", default="M1,M5,M15,H1",
+                    help="P2: comma-separated timeframes (add M1 explicitly)")
+    ap.add_argument("--start", default=None, help="P2: start date YYYY-MM-DD")
+    ap.add_argument("--end", default=None, help="P2: end date YYYY-MM-DD")
+    ap.add_argument("--baseline-seeds", type=int, default=200,
+                    help="P2: random-baseline seeds per control (plan: 200)")
     args = ap.parse_args(argv)
+    if args.phase == "P2":
+        from core.research.runner import run_p2
+        fixture = None
+        engines = tuple(x.strip() for x in args.engines.split(",") if x.strip())
+        tfs = tuple(x.strip() for x in args.tf.split(",") if x.strip())
+        if args.fixture:
+            fixture = os.path.join(ROOT, args.fixture_path)
+        out = run_p2(os.path.join(ROOT, args.data_dir), symbol=args.symbol,
+                     engines=engines, timeframes=tfs, start=args.start,
+                     end=args.end, fixture_path=fixture,
+                     baseline_seeds=args.baseline_seeds,
+                     out_md=os.path.join(ROOT, "research", "P2_leaderboard.md"),
+                     trades_dir=os.path.join(ROOT, args.data_dir, "research"))
+        for r in out["rows"]:
+            print(f"{r['engine']}-{r['tf']}: {r['status']}"
+                  + (f" trades={r.get('trades')} PF={r.get('pf')} "
+                     f"E[R]={r.get('exp')}" if r.get("trades") is not None else ""))
+        print(f"trials tested (grid): {out['trials']}")
+        print("leaderboard -> research/P2_leaderboard.md")
+        return 0
     if args.phase != "P1":
         print(f"{args.phase} is not implemented yet (phases stop for owner approval).")
         return 2

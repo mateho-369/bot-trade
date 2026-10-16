@@ -11,8 +11,7 @@ implementations: each item is built only in its own phase, behind its gate.
   pushed and PR #6 is open -- the audit text saying "not committed" was
   true when written and is superseded by this note.
 
-## Locked for later phases (do NOT build yet)
-1. **ai_regime replacement (P4):** no AI may edit live config. Replace the
+## Locked for later phases (do NOT build yet)1. **ai_regime replacement (P4):** no AI may edit live config. Replace the
    v2 directives with a DETERMINISTIC table "Analyst regime -> preset":
    CHAOS => stand aside; RANGE => range engines only; TREND_UP/DOWN =>
    trend engines only; QUIET => wider time-stop or stand aside. The table
@@ -39,3 +38,20 @@ implementations: each item is built only in its own phase, behind its gate.
   tools/make_fixture.py. Fixture: tests/fixtures/XAUUSDm_M1_synthetic.parquet
   (synthetic, seeded, <1 MB -- pipeline checks only, never a result).
 - Tests: tests/ (22 offline tests) + the legacy verify_*.py suite.
+
+## P1 verdict (2026-10-16, real MT5 data run on Windows @ d585f26)
+- **SR_H1 baseline: FAIL.** Real run 2018-06..2026-10, per-bar spread +
+  bid/ask model: 1,216 trades, WR 31.7%, PF 0.903, net E[R] -0.0675
+  (95% CI -0.146..+0.010), gross +0.0033R, max DD 86R. Duel method
+  (fixed 0.30): PF 0.896, E[R] -0.0721R. BUY PF 1.064 (+0.042R);
+  SELL PF 0.731 (-0.200R); only 2025 had PF > 1 (1.12).
+- The documented 2024-2025 edge (PF 1.15, +0.020R) does NOT survive a
+  longer window with realistic costs. **Do not tune SR_H1 to make it
+  pass.** It may enter P2 only as one pre-registered candidate among
+  others (via the SMC/SR family as specified), with no special status.
+- Open diagnostic (into P2 tooling): zero SR trades before 2021 despite
+  H1 from 2018-06. From the code, warm-up cannot explain it (H4 EMA50
+  ready ~50 H4 bars, H1 ATR/EMA within ~200 H1 bars). The derived H4
+  frame starts at the first H1 bar (2018-06-28 00:00 UTC as returned).
+  `tools/diagnose_sr.py` prints the real first H4 timestamp, the funnel
+  per year and the first signal date on the Windows data.
