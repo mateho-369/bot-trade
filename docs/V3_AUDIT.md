@@ -18,6 +18,10 @@
   (`core/data/`, `core/costs.py`, `core/ml/`, `core/execution/`, `research/`, `tools/run_phase.py` តាមផែនការ P1+)
   ដើម្បីឱ្យ code ចាស់នៅ `main` ដំណើរការដដែល ១០០% រហូតដល់ v3 ឆ្លង gates។
 - **មិនទាន់ commit / push អ្វីទាំងអស់** — រង់ចាំការយល់ព្រមពីអ្នក (Hard Rule #5)។
+  *(បច្ចុប្បន្នភាព 2026-10-16: ប្រយោគនេះពិតនៅពេលសរសេរ។ ក្រោយមក អ្នកបានសុំបើក PR —
+  commit `6c62410` ត្រូវបាន push ហើយ PR #6 កំពុងបើក។ ម្ចាស់បានយល់ព្រមឱ្យ commit
+  តូចៗលើ branch នេះបន្តទៀត; ហាម push ទៅ `main`, ហាម merge, ហាម force-push។
+  មើល `docs/V3_DECISIONS.md`។)*
 
 ## ១) អ្វីដែលខ្ញុំបានធ្វើក្នុង P0
 
